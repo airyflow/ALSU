@@ -1,0 +1,95 @@
+# -------------------------
+# Python
+# -------------------------
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.pkl
+*.pickle
+*.ipynb_checkpoints/
+
+# -------------------------
+# Virtual environments
+# -------------------------
+.env
+.venv
+venv/
+env/
+*.egg-info/
+
+# -------------------------
+# Build / cache
+# -------------------------
+build/
+dist/
+*.egg
+*.log
+*.tmp
+*.cache/
+.cache/
+pip-wheel-metadata/
+
+# -------------------------
+# Jupyter
+# -------------------------
+.ipynb_checkpoints/
+*.ipynb_checkpoints/
+
+# -------------------------
+# VSCode / IDE
+# -------------------------
+.vscode/
+.idea/
+*.swp
+
+# -------------------------
+# Data files (large)
+# -------------------------
+*.csv.gz
+*.npy
+*.npz
+*.sdf
+*.pdb
+*.pt
+*.ckpt
+*.pth
+*.bin
+*.h5
+*.tar
+*.tar.gz
+*.zip
+
+# -------------------------
+# Model Zoo (large)
+# -------------------------
+models/
+model_zoo/
+checkpoints/
+pretrained/
+*.pt
+*.ckpt
+
+# -------------------------
+# MolPAL / MUBen outputs
+# -------------------------
+results/
+outputs/
+runs/
+wandb/
+tensorboard/
+logs/
+
+# -------------------------
+# Local config
+# -------------------------
+*.local
+*.env
+config.yaml
+config_local.yaml
+
+# -------------------------
+# OS files
+# -------------------------
+.DS_Store
+Thumbs.db
