@@ -28,6 +28,9 @@ python run_experiments.py --plot-only
 """
 
 import argparse
+import base64
+import datetime
+import io
 import json
 import pickle
 import time
@@ -487,6 +490,319 @@ def print_summary(df: pd.DataFrame):
 
 
 # ==============================================================================
+# REPORT GENERATION
+# ==============================================================================
+
+_MODEL_DESCRIPTIONS = {
+    "molformer": {
+        "full_name":    "MoLFormer (SingleBackbone)",
+        "backbone":     "MoLFormer-XL (768-d language model embeddings)",
+        "surrogate":    "SingleBackboneMVESurrogate — dual MVE heads on a "
+                        "Linear(768→1024)→ReLU→BN→Dropout→Linear(1024→512) backbone",
+        "loss":         "CombinedLoss = MVE (Gaussian NLL) + 0.1 × Spearman",
+        "acquisition":  "UCB: μ + 2σ",
+        "schedule":     "5 × MoLFormer rounds",
+    },
+    "smallfusion_5lt": {
+        "full_name":    "SmallFusion-5LT (Lightweight)",
+        "backbone":     "Concatenated GROVER (256-d) + MoLFormer (768-d) + UniMol (512-d) = 1536-d",
+        "surrogate":    "LightweightMVESurrogate — dual MVE heads on a "
+                        "Linear(1536→1024)→ReLU→BN→Dropout→Linear(1024→512) backbone",
+        "loss":         "CombinedLoss = MVE + 0.1 × Spearman",
+        "acquisition":  "UCB: μ + 2σ",
+        "schedule":     "5 × Lightweight (fused) rounds",
+    },
+    "mixed_3lt_2g": {
+        "full_name":    "Mixed 3LT+2G",
+        "backbone":     "Phase 1: Fused 1536-d  |  Phase 2: GROVER 256-d",
+        "surrogate":    "Phase 1: LightweightMVESurrogate  |  Phase 2: SingleBackboneMVESurrogate",
+        "loss":         "CombinedLoss = MVE + 0.1 × Spearman",
+        "acquisition":  "UCB: μ + 2σ",
+        "schedule":     "3 × Lightweight (fused) rounds, then 2 × GROVER (SingleBackbone) rounds",
+    },
+    "mixed_4lt_1g": {
+        "full_name":    "Mixed 4LT+1G",
+        "backbone":     "Phase 1: Fused 1536-d  |  Phase 2: GROVER 256-d",
+        "surrogate":    "Phase 1: LightweightMVESurrogate  |  Phase 2: SingleBackboneMVESurrogate",
+        "loss":         "CombinedLoss = MVE + 0.1 × Spearman",
+        "acquisition":  "UCB: μ + 2σ",
+        "schedule":     "4 × Lightweight (fused) rounds, then 1 × GROVER (SingleBackbone) round",
+    },
+    "bigfusion": {
+        "full_name":    "BigFusion (Borda Count)",
+        "backbone":     "3 independent backbones: GROVER (256-d), MoLFormer (768-d), UniMol (512-d)",
+        "surrogate":    "BigFusionSurrogate — 3 independent SingleBackboneMVESurrogates, "
+                        "predictions combined via Borda count",
+        "loss":         "CombinedLoss = MVE + 0.1 × Spearman (per backbone)",
+        "acquisition":  "Borda count: R_i = r_i^GROVER + r_i^MoLFormer + r_i^UniMol (lower = better)",
+        "schedule":     "5 × BigFusion rounds",
+    },
+}
+
+_CSS = """
+body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    max-width: 1100px; margin: 40px auto; padding: 0 24px;
+    color: #2c3e50; background: #f8f9fa;
+}
+h1 { color: #1a252f; border-bottom: 3px solid #3498db; padding-bottom: 8px; }
+h2 { color: #2980b9; margin-top: 40px; border-left: 4px solid #3498db; padding-left: 12px; }
+h3 { color: #34495e; margin-top: 28px; }
+table { border-collapse: collapse; width: 100%; margin: 16px 0; }
+th { background: #2980b9; color: white; padding: 10px 14px; text-align: left; }
+td { padding: 8px 14px; border-bottom: 1px solid #dee2e6; }
+tr:nth-child(even) { background: #f1f4f8; }
+tr:hover { background: #e8f0fe; }
+.badge { display: inline-block; padding: 2px 10px; border-radius: 12px;
+         font-size: 0.8em; font-weight: bold; color: white; }
+.best  { background: #27ae60; }
+.good  { background: #2980b9; }
+.ok    { background: #e67e22; }
+.cfg   { background: #f1f4f8; border: 1px solid #dee2e6; border-radius: 6px;
+         padding: 16px 24px; margin: 12px 0; }
+.cfg dt { font-weight: bold; color: #2980b9; float: left; width: 180px; }
+.cfg dd { margin-left: 190px; margin-bottom: 6px; }
+.model-card { background: white; border: 1px solid #dee2e6; border-radius: 8px;
+              padding: 20px; margin: 20px 0; box-shadow: 0 1px 4px rgba(0,0,0,.08); }
+img { max-width: 100%; border-radius: 8px; margin: 12px 0; }
+code { background: #f1f4f8; padding: 2px 6px; border-radius: 4px; font-size: 0.9em; }
+.footer { font-size: 0.85em; color: #7f8c8d; border-top: 1px solid #dee2e6;
+          margin-top: 48px; padding-top: 12px; }
+"""
+
+
+def _fig_to_b64(fig) -> str:
+    """Render a matplotlib figure to a base64-encoded PNG string."""
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", dpi=150, bbox_inches="tight")
+    buf.seek(0)
+    return base64.b64encode(buf.read()).decode()
+
+
+def _make_recall_plot_b64(df: pd.DataFrame) -> str:
+    fig, ax = plt.subplots(figsize=(9, 6))
+    for name, grp in df.groupby("model"):
+        agg = grp.groupby("n_labeled")["recall"].agg(["mean", "std"]).reset_index()
+        ax.plot(
+            agg["n_labeled"], agg["mean"] * 100,
+            color=COLORS.get(name, "gray"),
+            marker="o", markersize=4,
+            label=LABELS.get(name, name),
+        )
+        if len(grp["seed"].unique()) > 1:
+            ax.fill_between(
+                agg["n_labeled"],
+                (agg["mean"] - agg["std"]) * 100,
+                (agg["mean"] + agg["std"]) * 100,
+                alpha=0.15, color=COLORS.get(name, "gray"),
+            )
+    ax.set_xlabel("Molecules explored", fontsize=12)
+    ax.set_ylabel(f"Top-{TOP_K} recall (%)", fontsize=11)
+    ax.set_title(
+        f"Active learning on Enamine50k — top-{TOP_K} recall",
+        fontsize=13, fontweight="bold",
+    )
+    ax.yaxis.set_major_formatter(mtick.PercentFormatter())
+    ax.legend(fontsize=10)
+    ax.grid(alpha=0.3)
+    fig.tight_layout()
+    b64 = _fig_to_b64(fig)
+    plt.close(fig)
+    return b64
+
+
+def _summary_table_html(df: pd.DataFrame) -> str:
+    final = df[df["n_labeled"] == df["n_labeled"].max()].copy()
+    summary = (
+        final.groupby("model")["recall"]
+        .agg(mean="mean", std="std", best="max")
+        .reset_index()
+        .sort_values("mean", ascending=False)
+        .reset_index(drop=True)
+    )
+
+    rows = []
+    for rank, row in summary.iterrows():
+        badge_cls = "best" if rank == 0 else ("good" if rank == 1 else "ok")
+        badge     = f'<span class="badge {badge_cls}">#{rank + 1}</span>'
+        rows.append(
+            f"<tr><td>{badge} {LABELS.get(row['model'], row['model'])}</td>"
+            f"<td>{row['mean']*100:.1f}%</td>"
+            f"<td>{'±'}{row['std']*100:.1f}%</td>"
+            f"<td>{row['best']*100:.1f}%</td></tr>"
+        )
+
+    return (
+        "<table><thead><tr>"
+        "<th>Model</th><th>Mean Recall</th><th>Std</th><th>Best Recall</th>"
+        "</tr></thead><tbody>"
+        + "".join(rows)
+        + "</tbody></table>"
+    )
+
+
+def _per_model_html(df: pd.DataFrame, models: list) -> str:
+    parts = []
+    for name in models:
+        grp = df[df["model"] == name]
+        if grp.empty:
+            continue
+
+        desc = _MODEL_DESCRIPTIONS.get(name, {})
+        info_rows = "".join(
+            f"<dt>{k.replace('_', ' ').title()}</dt><dd>{v}</dd>"
+            for k, v in desc.items() if k != "full_name"
+        )
+
+        # Round-by-round table (averaged over seeds)
+        rnd_agg = (
+            grp.groupby("round")[["recall", "elapsed"]]
+            .agg(recall_mean=("recall", "mean"), recall_std=("recall", "std"),
+                 elapsed_mean=("elapsed", "mean"))
+            .reset_index()
+        )
+        rnd_rows = "".join(
+            f"<tr><td>{int(r['round'])}</td>"
+            f"<td>{r['recall_mean']*100:.1f}% ± {r['recall_std']*100:.1f}%</td>"
+            f"<td>{r['elapsed_mean']:.1f}s</td></tr>"
+            for _, r in rnd_agg.iterrows()
+        )
+
+        parts.append(f"""
+<div class="model-card">
+  <h3>{desc.get('full_name', name)}</h3>
+  <dl class="cfg">{info_rows}</dl>
+  <h4 style="margin-top:16px">Round-by-round results</h4>
+  <table>
+    <thead><tr><th>Round</th><th>Top-{TOP_K} Recall (mean ± std)</th><th>Time</th></tr></thead>
+    <tbody>{rnd_rows}</tbody>
+  </table>
+</div>""")
+
+    return "\n".join(parts)
+
+
+def _runtime_table_html(df: pd.DataFrame) -> str:
+    rt = (
+        df.groupby(["model", "round"])["elapsed"]
+        .mean()
+        .reset_index()
+        .pivot(index="model", columns="round", values="elapsed")
+    )
+    rt.columns = [f"Round {c}" for c in rt.columns]
+    rt.index   = [LABELS.get(m, m) for m in rt.index]
+    rt["Total (s)"] = rt.sum(axis=1)
+
+    header = "<tr><th>Model</th>" + "".join(f"<th>{c}</th>" for c in rt.columns) + "</tr>"
+    body   = "".join(
+        f"<tr><td>{idx}</td>"
+        + "".join(f"<td>{v:.1f}s</td>" for v in row)
+        + "</tr>"
+        for idx, row in rt.iterrows()
+    )
+    return f"<table><thead>{header}</thead><tbody>{body}</tbody></table>"
+
+
+def generate_report(df: pd.DataFrame, out_dir: Path):
+    """
+    Write a fully self-contained HTML report to out_dir/report.html.
+    All plots are embedded as base64 PNGs; no external dependencies.
+    """
+    models  = list(df["model"].unique())
+    n_seeds = df["seed"].nunique()
+    ts      = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
+
+    recall_img = _make_recall_plot_b64(df)
+    summary_tbl = _summary_table_html(df)
+    per_model   = _per_model_html(df, list(EXPERIMENTS.keys()))
+    runtime_tbl = _runtime_table_html(df)
+
+    html = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Virtual Screening Report — {DATASET}</title>
+<style>{_CSS}</style>
+</head>
+<body>
+
+<h1>Virtual Screening Report</h1>
+<p style="color:#7f8c8d">Generated {ts} &nbsp;|&nbsp; Dataset: <code>{DATASET}</code>
+&nbsp;|&nbsp; {n_seeds} seed(s): {sorted(df['seed'].unique().tolist())}</p>
+
+<!-- ── Configuration ── -->
+<h2>1. Configuration</h2>
+<dl class="cfg">
+  <dt>Dataset</dt>       <dd>{DATASET}</dd>
+  <dt>Pool size</dt>     <dd>~{df['n_labeled'].max() - BATCH_SIZE*N_ROUNDS + INIT_SIZE:,} molecules (after initial {INIT_SIZE:,})</dd>
+  <dt>Initial labeled</dt><dd>{INIT_SIZE:,} randomly sampled molecules</dd>
+  <dt>Batch size</dt>    <dd>{BATCH_SIZE:,} molecules acquired per round</dd>
+  <dt>AL rounds</dt>     <dd>{N_ROUNDS}</dd>
+  <dt>Top-K target</dt>  <dd>Top {TOP_K} docking scores ({TOP_K/500*100:.0f}% of pool)</dd>
+  <dt>Surrogate epochs</dt><dd>{EPOCHS} per round</dd>
+  <dt>Models compared</dt><dd>{len(models)}: {', '.join(LABELS.get(m, m) for m in models)}</dd>
+  <dt>Loss function</dt> <dd>CombinedLoss = MVE + 0.1 &times; Spearman</dd>
+  <dt>Acquisition (default)</dt><dd>UCB (&#946;=2); BigFusion uses Borda count</dd>
+</dl>
+
+<!-- ── Executive Summary ── -->
+<h2>2. Executive Summary</h2>
+{summary_tbl}
+<p style="font-size:.9em;color:#7f8c8d">Recall = fraction of the true top-{TOP_K}
+docking hits found among all explored molecules. Higher is better.</p>
+
+<!-- ── Recall plot ── -->
+<h2>3. Recall vs. Molecules Explored</h2>
+<img src="data:image/png;base64,{recall_img}"
+     alt="Recall vs molecules explored">
+<p style="font-size:.9em;color:#7f8c8d">
+Shaded bands show ±1 std over seeds (shown only when &gt;1 seed is available).
+</p>
+
+<!-- ── Per-model details ── -->
+<h2>4. Per-Model Details</h2>
+{per_model}
+
+<!-- ── Runtime ── -->
+<h2>5. Runtime Analysis</h2>
+{runtime_tbl}
+<p style="font-size:.9em;color:#7f8c8d">
+Times are seconds per AL round, averaged over seeds.
+BigFusion trains three independent surrogates per round, so it is typically
+2–3&times; slower than single-backbone methods.
+</p>
+
+<!-- ── References ── -->
+<h2>6. References</h2>
+<ol>
+  <li>Graff, D. E. et al. <em>Accelerating high-throughput virtual screening through
+      molecular pool-based active learning.</em> Chem. Sci. 12 (2021).</li>
+  <li>Rong, Y. et al. <em>Self-supervised graph transformer on large-scale molecular data
+      (GROVER).</em> NeurIPS 2020.</li>
+  <li>Ross, J. et al. <em>Large-scale chemical language representations capture
+      molecular structure and properties (MoLFormer).</em> Nat. Mach. Intell. 4 (2022).</li>
+  <li>Zhou, G. et al. <em>Uni-Mol: a universal 3D molecular representation learning
+      framework.</em> ICLR 2023.</li>
+  <li>Engilberge, M. et al. <em>SoDeep: A sorting deep net to learn ranking loss
+      surrogates.</em> CVPR 2019.</li>
+</ol>
+
+<div class="footer">
+  ALSU — Active Learning with Surrogate Updates &nbsp;|&nbsp;
+  Report generated automatically by <code>run_experiments.py</code>
+</div>
+
+</body>
+</html>"""
+
+    out_path = out_dir / "report.html"
+    out_path.write_text(html, encoding="utf-8")
+    print(f"[report] {out_path}")
+    return out_path
+
+
+# ==============================================================================
 # ENTRY POINT
 # ==============================================================================
 
@@ -542,6 +858,8 @@ def main():
     out_dir = ROOT / "results" / "experiments" / DATASET
     plot_results(df, out_dir)
     print_summary(df)
+    report_path = generate_report(df, out_dir)
+    print(f"\nOpen the report:\n  Windows: start {report_path}\n  Linux:   xdg-open {report_path}")
 
 
 if __name__ == "__main__":
