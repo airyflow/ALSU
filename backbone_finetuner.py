@@ -15,6 +15,7 @@ finetuner.finetune(labeled_smiles, labeled_scores, n_epochs=10)
 new_embeddings = finetuner.extract_pool_embeddings()   # (N, D) float32
 """
 
+import sys
 import logging
 import numpy as np
 import torch
@@ -29,6 +30,13 @@ logger = logging.getLogger(__name__)
 ROOT = Path(__file__).resolve().parent
 MODEL_ZOO  = ROOT / "models"
 RESULTS_DIR = ROOT / "results" / "embed"
+
+# muben is a subdirectory of the repo, not an installed package.
+# The actual Python package lives at ALSU/muben/muben/, so we need
+# ALSU/muben/ on sys.path for "import muben" to resolve correctly.
+_MUBEN_ROOT = ROOT / "muben"
+if str(_MUBEN_ROOT) not in sys.path:
+    sys.path.insert(0, str(_MUBEN_ROOT))
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 

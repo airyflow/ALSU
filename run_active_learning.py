@@ -401,8 +401,13 @@ def main():
         # Pool = library SMILES intersected with oracle
         library_smiles = load_library_smiles(args.dataset)
         oracle         = load_oracle(args.dataset)
-        pool_smiles    = [s for s in library_smiles if s in oracle]
-        print(f"[pool] {len(pool_smiles):,} molecules (library ∩ oracle)")
+        seen = set()
+        pool_smiles = []
+        for s in library_smiles:
+            if s in oracle and s not in seen:
+                pool_smiles.append(s)
+                seen.add(s)
+        print(f"[pool] {len(pool_smiles):,} molecules (library ∩ oracle, deduped)")
 
         finetuner = BackboneFinetuner(
             backbone     = args.backbone,
