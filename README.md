@@ -288,6 +288,41 @@ python run_experiments.py --plot-only --seeds 42 43 44
 python run_experiments.py --force --seeds 42
 ```
 
+**Running one model and comparing it with others:**
+
+Already-finished runs are detected automatically via `history.json` and skipped,
+so you can run models independently in any order and compare them afterwards:
+
+```bash
+# Step 1 — run the model(s) you want
+python run_experiments.py --model bigfusion
+python run_experiments.py --model molformer       # optional — add more baselines
+
+# Step 2 — generate the comparison report from whatever runs exist
+python run_experiments.py --plot-only
+```
+
+`--plot-only` loads all completed runs, plots them together, and writes
+`results/experiments/Enamine50k/report.html`.  Missing models are skipped
+gracefully, so you can compare a subset at any time.
+
+**Generate the report after a full run:**
+
+```bash
+# After python run_experiments.py finishes, the report is written automatically.
+# To regenerate it without re-running the experiments:
+python run_experiments.py --plot-only
+```
+
+Open the report:
+```bash
+# Windows
+start results\experiments\Enamine50k\report.html
+
+# Linux / macOS
+xdg-open results/experiments/Enamine50k/report.html
+```
+
 **Model configurations:**
 
 | CLI name | Paper label | Description |
