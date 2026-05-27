@@ -25,6 +25,14 @@ from torch.utils.data import DataLoader, TensorDataset
 
 ROOT = Path(__file__).resolve().parent
 
+# Imported lazily when --finetune is used so the script stays importable
+# even without muben installed in non-finetuning runs.
+try:
+    from backbone_finetuner import BackboneFinetuner, MODEL_ZOO as _MODEL_ZOO
+except ImportError:
+    BackboneFinetuner = None
+    _MODEL_ZOO = ROOT / "models"
+
 # ── paths ─────────────────────────────────────────────────────────────────────
 EMBED_DIR  = ROOT / "results" / "embed"
 DATA_DIR   = ROOT / "data"
@@ -50,6 +58,18 @@ def load_embeddings(backbone: str, dataset: str) -> tuple[np.ndarray, list[str]]
     smiles     = data["smiles"].tolist()                 # [N]
     print(f"[embeddings] {backbone}: {embeddings.shape}")
     return embeddings, smiles
+
+
+def load_library_smiles(dataset: str) -> list[str]:
+    """Load SMILES from the molpal library (single source of truth for pool order)."""
+    lib = LIBRARY_DIR / f"{dataset}.csv.gz"
+    assert lib.exists(), f"Library not found: {lib}"
+    df = pd.read_csv(lib)
+    df.columns = df.columns.str.strip().str.lower()
+    smi_col = next(c for c in df.columns if "smiles" in c)
+    smiles = df[smi_col].dropna().tolist()
+    print(f"[library] {lib.name}: {len(smiles):,} SMILES")
+    return smiles
 
 
 def load_oracle(dataset: str) -> dict[str, float]:
@@ -202,8 +222,10 @@ ACQ = {"ucb": acq_ucb, "greedy": acq_greedy, "thompson": acq_thompson}
 class ALExplorer:
     def __init__(self, embed_matrix, pool_smiles, oracle, surrogate,
                  acq_fn, init_size=200, batch_size=100,
-                 n_rounds=15, run_dir=None):
-        self.X          = embed_matrix          # (N, D)  fixed
+                 n_rounds=15, run_dir=None,
+                 finetuner=None, finetune_epochs=10,
+                 finetune_lr_backbone=1e-5, finetune_lr_head=1e-4):
+        self.X          = embed_matrix          # (N, D)  — refreshed each round when finetuner is set
         self.smiles     = np.array(pool_smiles) # [N]
         self.oracle     = oracle                # smiles → kcal/mol (lower = better)
         self.surrogate  = surrogate
@@ -212,6 +234,12 @@ class ALExplorer:
         self.n_rounds   = n_rounds
         self.run_dir    = run_dir or RUNS_DIR / "al_run"
         self.run_dir.mkdir(parents=True, exist_ok=True)
+
+        # optional online backbone finetuner
+        self.finetuner           = finetuner
+        self.finetune_epochs     = finetune_epochs
+        self.finetune_lr_backbone = finetune_lr_backbone
+        self.finetune_lr_head    = finetune_lr_head
 
         # docking scores are negative: negate so surrogate maximises
         self._sign = -1.0
@@ -239,6 +267,20 @@ class ALExplorer:
 
         for rnd in range(self.n_rounds):
             t0 = time.perf_counter()
+
+            # 0. [optional] finetune backbone on labeled set, then refresh embeddings
+            if self.finetuner is not None:
+                labeled_smi = [self.smiles[i] for i in self.labeled_idx]
+                labeled_sc  = np.array(
+                    [self.labeled_scores[s] for s in labeled_smi], dtype=np.float32
+                )
+                self.finetuner.finetune(
+                    labeled_smi, labeled_sc,
+                    n_epochs    = self.finetune_epochs,
+                    lr_backbone = self.finetune_lr_backbone,
+                    lr_head     = self.finetune_lr_head,
+                )
+                self.X = self.finetuner.extract_pool_embeddings()
 
             # 1. labeled embeddings + scores (negated for maximisation)
             idx  = list(self.labeled_idx)
@@ -326,6 +368,15 @@ def parse_args():
     p.add_argument("--n-ensemble", type=int, default=5)
     p.add_argument("--epochs",     type=int, default=80)
     p.add_argument("--seed",       type=int, default=42)
+    # ── online backbone finetuning ────────────────────────────────────────────
+    p.add_argument("--finetune",    action="store_true",
+                   help="Finetune backbone at each AL round (requires muben)")
+    p.add_argument("--finetune-epochs",      type=int,   default=10,
+                   help="Gradient epochs per AL round when finetuning")
+    p.add_argument("--finetune-lr-backbone", type=float, default=1e-5,
+                   help="Backbone learning rate during finetuning")
+    p.add_argument("--finetune-lr-head",     type=float, default=1e-4,
+                   help="Regression head learning rate during finetuning")
     return p.parse_args()
 
 
@@ -337,10 +388,36 @@ def main():
     print(f"\n{'='*60}")
     print(f"  dataset={args.dataset}  backbone={args.backbone}")
     print(f"  uq={args.uq}  acq={args.acq}  device={DEVICE}")
+    print(f"  finetune={args.finetune}"
+          + (f"  ft_epochs={args.finetune_epochs}" if args.finetune else ""))
     print(f"{'='*60}\n")
 
-    matrix, pool_smiles, oracle = build_pool(args.backbone, args.dataset)
+    # ── build pool ─────────────────────────────────────────────────────────────
+    if args.finetune:
+        if BackboneFinetuner is None:
+            raise RuntimeError("backbone_finetuner.py could not be imported. "
+                               "Make sure muben is on sys.path.")
 
+        # Pool = library SMILES intersected with oracle
+        library_smiles = load_library_smiles(args.dataset)
+        oracle         = load_oracle(args.dataset)
+        pool_smiles    = [s for s in library_smiles if s in oracle]
+        print(f"[pool] {len(pool_smiles):,} molecules (library ∩ oracle)")
+
+        finetuner = BackboneFinetuner(
+            backbone     = args.backbone,
+            dataset_name = args.dataset,
+            pool_smiles  = pool_smiles,
+            model_zoo    = _MODEL_ZOO,
+        )
+        # Initial embeddings come from the pretrained (not yet finetuned) backbone
+        matrix = finetuner.extract_pool_embeddings()
+    else:
+        # Default path: load pre-extracted static embeddings
+        matrix, pool_smiles, oracle = build_pool(args.backbone, args.dataset)
+        finetuner = None
+
+    # ── surrogate ──────────────────────────────────────────────────────────────
     surrogate = Surrogate(
         in_dim     = matrix.shape[1],
         uq         = args.uq,
@@ -349,18 +426,26 @@ def main():
         n_ensemble = args.n_ensemble,
     )
 
-    run_dir = RUNS_DIR / f"al_{args.dataset}_{args.backbone}_{args.uq}_{args.acq}"
+    # ── run dir (mark finetuned runs separately) ───────────────────────────────
+    run_suffix = f"al_{args.dataset}_{args.backbone}_{args.uq}_{args.acq}"
+    if args.finetune:
+        run_suffix += "_finetuned"
+    run_dir = RUNS_DIR / run_suffix
 
     explorer = ALExplorer(
-        embed_matrix = matrix,
-        pool_smiles  = pool_smiles,
-        oracle       = oracle,
-        surrogate    = surrogate,
-        acq_fn       = ACQ[args.acq],
-        init_size    = args.init_size,
-        batch_size   = args.batch_size,
-        n_rounds     = args.n_rounds,
-        run_dir      = run_dir,
+        embed_matrix      = matrix,
+        pool_smiles       = pool_smiles,
+        oracle            = oracle,
+        surrogate         = surrogate,
+        acq_fn            = ACQ[args.acq],
+        init_size         = args.init_size,
+        batch_size        = args.batch_size,
+        n_rounds          = args.n_rounds,
+        run_dir           = run_dir,
+        finetuner         = finetuner,
+        finetune_epochs   = args.finetune_epochs,
+        finetune_lr_backbone = args.finetune_lr_backbone,
+        finetune_lr_head     = args.finetune_lr_head,
     )
 
     history = explorer.run()
