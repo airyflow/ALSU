@@ -144,6 +144,13 @@ def acq_thompson(mu, sigma):        return np.random.normal(mu, sigma)
 def acq_borda(mu, sigma):           return mu   # BigFusion: mu IS the Borda score
 
 
+def _spearmanr_np(x: np.ndarray, y: np.ndarray) -> float:
+    """Spearman ρ without scipy dependency."""
+    x_rank = np.argsort(np.argsort(x)).astype(float)
+    y_rank = np.argsort(np.argsort(y)).astype(float)
+    return float(np.corrcoef(x_rank, y_rank)[0, 1])
+
+
 # ==============================================================================
 # ACTIVE LEARNING LOOP
 # ==============================================================================
@@ -241,6 +248,18 @@ class Experiment:
 
                 # 2. Fit surrogate
                 surrogate.fit(X_tr, y_tr, epochs=self.epochs)
+
+                # ── Surrogate quality diagnostics ────────────────────────────
+                mu_tr, _  = surrogate.predict(X_tr)
+                rho_train = _spearmanr_np(mu_tr, y_tr)
+
+                mu_all_diag, _ = surrogate.predict(X_all)
+                y_all_oracle = self._SIGN * np.array(
+                    [self.oracle[s] for s in self.smiles], dtype=np.float32
+                )
+                rho_pool = _spearmanr_np(mu_all_diag, y_all_oracle)
+                print(f"  [diag] Spearman: train={rho_train:.3f}  pool={rho_pool:.3f}")
+                # ── End diagnostics ───────────────────────────────────────────
 
                 # 3. Predict unlabeled pool
                 mask     = np.ones(len(self.smiles), bool)

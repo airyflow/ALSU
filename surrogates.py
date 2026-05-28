@@ -55,7 +55,7 @@ class _MVEHead(nn.Module):
 
     def forward(self, h: torch.Tensor):
         mu  = self.mu_net(h).squeeze(-1)
-        var = F.softplus(self.var_net(h).squeeze(-1)) + 1e-6
+        var = F.softplus(self.var_net(h).squeeze(-1)) + 0.01
         return mu, var
 
 
@@ -140,6 +140,8 @@ def _train_model(
                 mu, var = model(xb)
                 loss    = loss_fn(mu, var, yb)
             scaler.scale(loss).backward()
+            scaler.unscale_(opt)
+            nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             scaler.step(opt)
             scaler.update()
 
