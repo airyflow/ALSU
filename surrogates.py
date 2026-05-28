@@ -39,18 +39,18 @@ class _MVEHead(nn.Module):
     """
     Single MVE head: predicts (μ, σ²) from a shared latent vector h.
 
-    mu  : Linear(h_dim, 256) → ReLU → Dropout → Linear(256, 1)
+    mu  : Linear(h_dim, 64) → ReLU → Dropout → Linear(64, 1)
     var : same → softplus + 1e-6
     """
     def __init__(self, h_dim: int, dropout: float = 0.25):
         super().__init__()
         self.mu_net = nn.Sequential(
-            nn.Linear(h_dim, 256), nn.ReLU(), nn.Dropout(dropout),
-            nn.Linear(256, 1),
+            nn.Linear(h_dim, 64), nn.ReLU(), nn.Dropout(dropout),
+            nn.Linear(64, 1),
         )
         self.var_net = nn.Sequential(
-            nn.Linear(h_dim, 256), nn.ReLU(), nn.Dropout(dropout),
-            nn.Linear(256, 1),
+            nn.Linear(h_dim, 64), nn.ReLU(), nn.Dropout(dropout),
+            nn.Linear(64, 1),
         )
 
     def forward(self, h: torch.Tensor):
@@ -62,20 +62,22 @@ class _MVEHead(nn.Module):
 class _LightweightBackbone(nn.Module):
     """
     Shared backbone from the paper:
-      Linear(in_dim, 1024) → ReLU → BN → Dropout
-      Linear(1024, 512)    → ReLU → BN → Dropout
-    Output shape: (B, 512)
+      Linear(in_dim, 256) → ReLU → BN → Dropout
+      Linear(256, 128)    → ReLU → BN → Dropout
+    Output shape: (B, 128)
+
+    Sized for actual embedding dims (GROVER=1600, MoLFormer=768, UniMol=512).
     """
     def __init__(self, in_dim: int, dropout: float = 0.25):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Linear(in_dim, 1024),
+            nn.Linear(in_dim, 256),
             nn.ReLU(),
-            nn.BatchNorm1d(1024),
+            nn.BatchNorm1d(256),
             nn.Dropout(dropout),
-            nn.Linear(1024, 512),
+            nn.Linear(256, 128),
             nn.ReLU(),
-            nn.BatchNorm1d(512),
+            nn.BatchNorm1d(128),
             nn.Dropout(dropout),
         )
 
@@ -85,7 +87,7 @@ class _LightweightBackbone(nn.Module):
 
 class _DualMVEModel(nn.Module):
     """
-    Full model: backbone → two independent MVE heads → averaged output.
+    Full model: backbone (→128) → two independent MVE heads → averaged output.
 
     mean = 0.5 * (mu1 + mu2)
     var  = 0.5 * (var1 + var2)
@@ -93,8 +95,8 @@ class _DualMVEModel(nn.Module):
     def __init__(self, in_dim: int, dropout: float = 0.25):
         super().__init__()
         self.backbone = _LightweightBackbone(in_dim, dropout)
-        self.head1    = _MVEHead(512, dropout)
-        self.head2    = _MVEHead(512, dropout)
+        self.head1    = _MVEHead(128, dropout)
+        self.head2    = _MVEHead(128, dropout)
 
     def forward(self, x: torch.Tensor):
         h = self.backbone(x)
