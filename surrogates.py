@@ -405,20 +405,26 @@ class EnsembleFusionSurrogate:
 
     def predict(self, X: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         parts = X if isinstance(X, dict) else self._split(X)
+        n = len(next(iter(parts.values())))
 
-        mus, sigs = [], []
+        mus = []
         for k in self._KEYS:
-            mu, sig = self._surrogates[k].predict(parts[k])
+            mu, _ = self._surrogates[k].predict(parts[k])
             mus.append(mu)
-            sigs.append(sig)
 
-        mus  = np.stack(mus)          # (3, N)
-        sigs = np.stack(sigs)         # (3, N)
-        w    = self._weights[:, None] # (3, 1)
+        # Convert each backbone's predictions to percentile ranks in [0, 1].
+        # This makes the combination scale-invariant (like Borda count) while
+        # keeping a continuous signal for both mean and uncertainty estimation.
+        rank_mus = np.stack([
+            np.argsort(np.argsort(mu)).astype(np.float32) / max(n - 1, 1)
+            for mu in mus
+        ])  # (3, N)
 
-        mu_ens    = (mus * w).sum(axis=0)
-        sig_inter = np.sqrt((w * (mus - mu_ens[None, :]) ** 2).sum(axis=0))
-        sig_intra = (sigs * w).sum(axis=0)
-        sig_total = np.sqrt(sig_inter ** 2 + sig_intra ** 2)
+        # Weighted mean percentile rank — higher = better predicted binder
+        w       = self._weights[:, None]          # (3, 1)
+        mu_ens  = (rank_mus * w).sum(axis=0)      # (N,)
 
-        return mu_ens.astype(np.float32), sig_total.astype(np.float32)
+        # Inter-model rank disagreement as epistemic uncertainty
+        sig_ens = np.sqrt((w * (rank_mus - mu_ens[None, :]) ** 2).sum(axis=0))
+
+        return mu_ens.astype(np.float32), sig_ens.astype(np.float32)
