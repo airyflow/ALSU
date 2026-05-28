@@ -27,6 +27,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, TensorDataset
+from sklearn.linear_model import RidgeCV
 
 from losses import CombinedLoss
 
@@ -279,9 +280,10 @@ class BigFusionSurrogate:
     def __init__(
         self,
         dims: dict,
-        spearman_weight: float = 0.1,
-        lr: float              = 3e-4,
-        dropout: float         = 0.25,
+        spearman_weight: float  = 0.1,
+        lr: float               = 3e-4,
+        dropout: float          = 0.25,
+        weights: dict | None    = None,
     ):
         self._dims = dims
         self._surrogates = {
@@ -293,6 +295,12 @@ class BigFusionSurrogate:
             )
             for k in self._KEYS
         }
+        # Normalise weights so they sum to 1; default = uniform
+        if weights is None:
+            self._w = {k: 1 / len(self._KEYS) for k in self._KEYS}
+        else:
+            total = sum(weights[k] for k in self._KEYS)
+            self._w = {k: weights[k] / total for k in self._KEYS}
 
     def _split(self, X: np.ndarray) -> dict:
         """Split concatenated embedding matrix into per-backbone dict."""
@@ -312,13 +320,11 @@ class BigFusionSurrogate:
         borda = np.zeros(n, dtype=np.float64)
         for k in self._KEYS:
             mu, _ = self._surrogates[k].predict(parts[k])
-            # rank: 1 = highest μ (best predicted score), N = lowest
             order = np.argsort(mu)[::-1]
             ranks = np.empty(n)
             ranks[order] = np.arange(1, n + 1)
-            borda += ranks
+            borda += self._w[k] * ranks   # weighted Borda contribution
 
-        # Return negative Borda sum so that acquisition can maximise
         return -borda.astype(np.float32), np.zeros(n, dtype=np.float32)
 
 
@@ -397,3 +403,102 @@ class EnsembleFusionSurrogate:
             borda += ranks
 
         return -borda.astype(np.float32), np.zeros(n, dtype=np.float32)
+
+
+# ── LearnedFusionSurrogate ─────────────────────────────────────────────────────
+
+class LearnedFusionSurrogate:
+    """
+    Three independent SingleBackbone surrogates whose predictions are combined
+    by a RidgeCV linear meta-learner trained on held-out labeled data.
+
+    Unlike Borda count (rank-based, scale-invariant), the meta-learner combines
+    raw predicted scores: mu_meta = w_g*mu_g + w_m*mu_m + w_u*mu_u + bias.
+    This corrects for backbone-specific scale biases and learns the relative
+    contribution of each backbone from data rather than from heuristics.
+
+    fit() workflow:
+      1. 80/20 split of labeled data.
+      2. Train all three backbone surrogates on the 80% training split.
+      3. Predict on the 20% holdout → honest (non-overfitted) backbone µ values.
+      4. Fit RidgeCV meta-learner on [µ_g, µ_m, µ_u] → y_holdout.
+      Backbone models stay fitted on the 80% split (not retrained on full data).
+
+    predict() returns (mu_meta, zeros) — use with acq_greedy.
+
+    Parameters
+    ----------
+    dims : dict {"grover": int, "molformer": int, "unimol": int}
+    """
+
+    _KEYS = ["grover", "molformer", "unimol"]
+
+    def __init__(
+        self,
+        dims: dict,
+        spearman_weight: float = 0.1,
+        lr: float              = 3e-4,
+        dropout: float         = 0.25,
+    ):
+        self._dims = dims
+        self._surrogates = {
+            k: SingleBackboneMVESurrogate(
+                in_dim          = dims[k],
+                spearman_weight = spearman_weight,
+                lr              = lr,
+                dropout         = dropout,
+            )
+            for k in self._KEYS
+        }
+        self._meta = RidgeCV(alphas=[0.01, 0.1, 1.0, 10.0, 100.0])
+        self._meta_fitted = False
+
+    def _split(self, X: np.ndarray) -> dict:
+        cuts = np.cumsum([self._dims[k] for k in self._KEYS])
+        splits = np.split(X, cuts[:-1], axis=1)
+        return {k: s for k, s in zip(self._KEYS, splits)}
+
+    def fit(self, X: np.ndarray, y: np.ndarray, epochs: int = 50, batch: int = 256):
+        parts = X if isinstance(X, dict) else self._split(X)
+        n     = len(y)
+
+        # 80/20 holdout — meta-learner must see out-of-sample backbone predictions
+        rng     = np.random.default_rng(n)
+        val_idx = rng.choice(n, size=max(1, n // 5), replace=False)
+        tr_mask = np.ones(n, dtype=bool);  tr_mask[val_idx] = False
+
+        parts_tr = {k: v[tr_mask]  for k, v in parts.items()}
+        parts_vl = {k: v[~tr_mask] for k, v in parts.items()}
+        y_tr, y_vl = y[tr_mask], y[~tr_mask]
+
+        for k in self._KEYS:
+            self._surrogates[k].fit(parts_tr[k], y_tr, epochs=epochs, batch=batch)
+
+        # Collect holdout predictions → feature matrix for meta-learner
+        val_mus = np.stack(
+            [self._surrogates[k].predict(parts_vl[k])[0] for k in self._KEYS],
+            axis=1,
+        )  # (n_val, 3)
+        self._meta.fit(val_mus, y_vl)
+        self._meta_fitted = True
+
+        coef_str = "  ".join(f"{k}:{c:.3f}" for k, c in
+                              zip(self._KEYS, self._meta.coef_))
+        print(f"  [LearnedFusion] meta coef — {coef_str}  "
+              f"bias:{self._meta.intercept_:.3f}  α={self._meta.alpha_:.3g}")
+
+    def predict(self, X: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        parts = X if isinstance(X, dict) else self._split(X)
+        n     = len(next(iter(parts.values())))
+
+        mus = np.stack(
+            [self._surrogates[k].predict(parts[k])[0] for k in self._KEYS],
+            axis=1,
+        )  # (N, 3)
+
+        if self._meta_fitted:
+            mu_out = self._meta.predict(mus).astype(np.float32)
+        else:
+            mu_out = mus.mean(axis=1).astype(np.float32)
+
+        return mu_out, np.zeros(n, dtype=np.float32)
