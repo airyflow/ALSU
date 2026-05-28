@@ -99,7 +99,7 @@ def download_molformer(target_dir):
 
 if __name__ == "__main__":
     # Centralized Model Shared Folder Layout Target
-    BASE_MODEL_DIR = Path("/home/jmeng/repos/models") # <--- change this folder name
+    BASE_MODEL_DIR = Path(__file__).resolve().parent.parent / "models"
     
     print(f"Initializing Shared Model Zoo at: {BASE_MODEL_DIR}")
     dirs = setup_directories(BASE_MODEL_DIR)
