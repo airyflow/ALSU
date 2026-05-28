@@ -46,6 +46,7 @@ from surrogates import (
     SingleBackboneMVESurrogate,
     LightweightMVESurrogate,
     BigFusionSurrogate,
+    EnsembleFusionSurrogate,
 )
 
 ROOT       = Path(__file__).resolve().parent
@@ -363,12 +364,22 @@ def build_bigfusion(emb_dict):
     )]
 
 
+def build_ensemble_fusion(emb_dict):
+    dims = {k: emb_dict[k].shape[1] for k in ["grover", "molformer", "unimol"]}
+    return [(
+        N_ROUNDS,
+        EnsembleFusionSurrogate(dims=dims),
+        "bigfusion",   # same fused embedding input as bigfusion
+    )]
+
+
 EXPERIMENTS = {
-    "molformer":        (build_molformer,       acq_ucb),
-    "smallfusion_5lt":  (build_smallfusion_5lt, acq_ucb),
-    "mixed_3lt_2g":     (build_mixed_3lt_2g,    acq_ucb),
-    "mixed_4lt_1g":     (build_mixed_4lt_1g,    acq_ucb),
-    "bigfusion":        (build_bigfusion,        acq_borda),
+    "molformer":        (build_molformer,        acq_ucb),
+    "smallfusion_5lt":  (build_smallfusion_5lt,  acq_ucb),
+    "mixed_3lt_2g":     (build_mixed_3lt_2g,     acq_ucb),
+    "mixed_4lt_1g":     (build_mixed_4lt_1g,     acq_ucb),
+    "bigfusion":        (build_bigfusion,         acq_borda),
+    "ensemble_fusion":  (build_ensemble_fusion,   acq_ucb),
 }
 
 
@@ -409,18 +420,20 @@ def run_one(name: str, emb_dict: dict, pool_smiles: list, oracle: dict, seed: in
 # ==============================================================================
 
 COLORS = {
-    "molformer":       "#E07B4F",
-    "smallfusion_5lt": "#5B8DD9",
-    "mixed_3lt_2g":    "#9B59B6",
-    "mixed_4lt_1g":    "#E74C3C",
-    "bigfusion":       "#6DBF87",
+    "molformer":        "#E07B4F",
+    "smallfusion_5lt":  "#5B8DD9",
+    "mixed_3lt_2g":     "#9B59B6",
+    "mixed_4lt_1g":     "#E74C3C",
+    "bigfusion":        "#6DBF87",
+    "ensemble_fusion":  "#F1C40F",
 }
 LABELS = {
-    "molformer":       "Molformer",
-    "smallfusion_5lt": "SmallFusion(5LT)",
-    "mixed_3lt_2g":    "Mixed(3LT+2G)",
-    "mixed_4lt_1g":    "Mixed(4LT+1G)",
-    "bigfusion":       "Bigfusion",
+    "molformer":        "Molformer",
+    "smallfusion_5lt":  "SmallFusion(5LT)",
+    "mixed_3lt_2g":     "Mixed(3LT+2G)",
+    "mixed_4lt_1g":     "Mixed(4LT+1G)",
+    "bigfusion":        "Bigfusion",
+    "ensemble_fusion":  "EnsembleFusion (new)",
 }
 
 
@@ -555,6 +568,17 @@ _MODEL_DESCRIPTIONS = {
         "loss":         "CombinedLoss = MVE + 0.1 × Spearman (per backbone)",
         "acquisition":  "Borda count: R_i = r_i^GROVER + r_i^MoLFormer + r_i^UniMol (lower = better)",
         "schedule":     "5 × BigFusion rounds",
+    },
+    "ensemble_fusion": {
+        "full_name":    "EnsembleFusion (Adaptive Weighted Ensemble)",
+        "backbone":     "3 independent backbones: GROVER, MoLFormer, UniMol",
+        "surrogate":    "EnsembleFusionSurrogate — 3 SingleBackboneMVESurrogates with adaptive "
+                        "weights proportional to each backbone's training-set Spearman ρ. "
+                        "Returns real (μ, σ) where σ combines inter-model disagreement (epistemic) "
+                        "and per-model MVE uncertainty (aleatoric).",
+        "loss":         "CombinedLoss = MVE + 0.1 × Spearman (per backbone)",
+        "acquisition":  "UCB: μ_ens + 2·σ_total  (soft combination, not hard Borda)",
+        "schedule":     "5 × EnsembleFusion rounds",
     },
 }
 

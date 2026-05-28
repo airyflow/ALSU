@@ -320,3 +320,105 @@ class BigFusionSurrogate:
 
         # Return negative Borda sum so that acquisition can maximise
         return -borda.astype(np.float32), np.zeros(n, dtype=np.float32)
+
+
+# ── EnsembleFusionSurrogate ────────────────────────────────────────────────────
+
+def _spearman_np(x: np.ndarray, y: np.ndarray) -> float:
+    """Pure-numpy Spearman ρ."""
+    xr = np.argsort(np.argsort(x)).astype(float)
+    yr = np.argsort(np.argsort(y)).astype(float)
+    xc, yc = xr - xr.mean(), yr - yr.mean()
+    denom = np.sqrt((xc ** 2).sum() * (yc ** 2).sum()) + 1e-8
+    return float((xc * yc).sum() / denom)
+
+
+class EnsembleFusionSurrogate:
+    """
+    Three independent SingleBackbone surrogates combined via adaptive weighted
+    ensemble instead of Borda count.
+
+    After each fit(), each backbone's weight is set proportional to its
+    Spearman ρ on the training set.  This lets the ensemble adapt as data
+    accumulates — backbones with better in-distribution correlation receive
+    higher influence on acquisition scores.
+
+    predict() returns real (mu, sigma) so that UCB can exploit inter-model
+    disagreement as epistemic uncertainty:
+
+      mu_ens    = Σ_k w_k · μ_k               (weighted mean)
+      σ_inter   = sqrt(Σ_k w_k · (μ_k − μ_ens)²)  (backbone disagreement)
+      σ_intra   = Σ_k w_k · σ_k               (average aleatoric uncertainty)
+      σ_total   = sqrt(σ_inter² + σ_intra²)
+
+    Parameters
+    ----------
+    dims : dict {"grover": int, "molformer": int, "unimol": int}
+    """
+
+    _KEYS = ["grover", "molformer", "unimol"]
+
+    def __init__(
+        self,
+        dims: dict,
+        spearman_weight: float = 0.1,
+        lr: float              = 3e-4,
+        dropout: float         = 0.25,
+    ):
+        self._dims = dims
+        self._surrogates = {
+            k: SingleBackboneMVESurrogate(
+                in_dim          = dims[k],
+                spearman_weight = spearman_weight,
+                lr              = lr,
+                dropout         = dropout,
+            )
+            for k in self._KEYS
+        }
+        self._weights = np.ones(3) / 3   # equal weights until first fit
+
+    def _split(self, X: np.ndarray) -> dict:
+        cuts = np.cumsum([self._dims[k] for k in self._KEYS])
+        splits = np.split(X, cuts[:-1], axis=1)
+        return {k: s for k, s in zip(self._KEYS, splits)}
+
+    def fit(self, X: np.ndarray, y: np.ndarray, epochs: int = 50, batch: int = 256):
+        parts = X if isinstance(X, dict) else self._split(X)
+
+        for k in self._KEYS:
+            self._surrogates[k].fit(parts[k], y, epochs=epochs, batch=batch)
+
+        # Recompute weights as normalised training-set Spearman correlations
+        rhos = []
+        for k in self._KEYS:
+            mu_tr, _ = self._surrogates[k].predict(parts[k])
+            rhos.append(max(_spearman_np(mu_tr, y), 0.0))  # clamp negative to 0
+
+        total = sum(rhos)
+        if total > 0:
+            self._weights = np.array(rhos) / total
+        else:
+            self._weights = np.ones(3) / 3
+
+        print(f"  [EnsembleFusion] weights — "
+              + "  ".join(f"{k}:{w:.3f}" for k, w in zip(self._KEYS, self._weights)))
+
+    def predict(self, X: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        parts = X if isinstance(X, dict) else self._split(X)
+
+        mus, sigs = [], []
+        for k in self._KEYS:
+            mu, sig = self._surrogates[k].predict(parts[k])
+            mus.append(mu)
+            sigs.append(sig)
+
+        mus  = np.stack(mus)          # (3, N)
+        sigs = np.stack(sigs)         # (3, N)
+        w    = self._weights[:, None] # (3, 1)
+
+        mu_ens    = (mus * w).sum(axis=0)
+        sig_inter = np.sqrt((w * (mus - mu_ens[None, :]) ** 2).sum(axis=0))
+        sig_intra = (sigs * w).sum(axis=0)
+        sig_total = np.sqrt(sig_inter ** 2 + sig_intra ** 2)
+
+        return mu_ens.astype(np.float32), sig_total.astype(np.float32)
