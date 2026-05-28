@@ -124,7 +124,7 @@ class GROVER(nn.Module):
         super(GROVER, self).__init__()
 
         # Load model and args
-        state = torch.load(config.checkpoint_path, map_location=lambda storage, loc: storage)
+        state = torch.load(config.checkpoint_path, map_location=lambda storage, loc: storage, weights_only=False)
         args, loaded_state_dict = state["args"], state["state_dict"]
         model_args = get_model_args()
 
