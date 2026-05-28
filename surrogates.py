@@ -335,25 +335,21 @@ def _spearman_np(x: np.ndarray, y: np.ndarray) -> float:
 
 class EnsembleFusionSurrogate:
     """
-    Three independent SingleBackbone surrogates combined via adaptive weighted
-    ensemble instead of Borda count.
+    Three independent SingleBackbone surrogates combined via UCB on normalised
+    Borda ranks.  Unlike BigFusion's greedy Borda, acquisition uses inter-model
+    rank disagreement as epistemic uncertainty, allowing exploration of molecules
+    where backbones disagree (potential high-scorers missed by any single backbone).
 
-    After each fit(), each backbone's weight is set proportional to its
-    Spearman ρ on the training set.  This lets the ensemble adapt as data
-    accumulates — backbones with better in-distribution correlation receive
-    higher influence on acquisition scores.
+    UCB_score = -mean_rank_norm + beta * std_rank_norm
+    predict() bakes UCB into mu and returns zeros for sigma — use with acq_greedy.
 
-    predict() returns real (mu, sigma) so that UCB can exploit inter-model
-    disagreement as epistemic uncertainty:
-
-      mu_ens    = Σ_k w_k · μ_k               (weighted mean)
-      σ_inter   = sqrt(Σ_k w_k · (μ_k − μ_ens)²)  (backbone disagreement)
-      σ_intra   = Σ_k w_k · σ_k               (average aleatoric uncertainty)
-      σ_total   = sqrt(σ_inter² + σ_intra²)
+    sigma is rank std across backbones (∈ [0, ~0.4]).  beta=0.2 is calibrated so
+    exploration contributes ~20% of the signal for the top candidates.
 
     Parameters
     ----------
     dims : dict {"grover": int, "molformer": int, "unimol": int}
+    beta : exploration weight (default 0.2)
     """
 
     _KEYS = ["grover", "molformer", "unimol"]
@@ -364,6 +360,7 @@ class EnsembleFusionSurrogate:
         spearman_weight: float = 0.1,
         lr: float              = 3e-4,
         dropout: float         = 0.25,
+        beta: float            = 0.2,
     ):
         self._dims = dims
         self._surrogates = {
@@ -375,7 +372,7 @@ class EnsembleFusionSurrogate:
             )
             for k in self._KEYS
         }
-        self._weights = np.ones(3) / 3   # equal weights until first fit
+        self._beta = beta
 
     def _split(self, X: np.ndarray) -> dict:
         cuts = np.cumsum([self._dims[k] for k in self._KEYS])
@@ -384,46 +381,24 @@ class EnsembleFusionSurrogate:
 
     def fit(self, X: np.ndarray, y: np.ndarray, epochs: int = 50, batch: int = 256):
         parts = X if isinstance(X, dict) else self._split(X)
-        n     = len(y)
-
-        # 80/20 holdout so val-ρ is honest (training ρ ≈ 0.99 for all backbones).
-        rng      = np.random.default_rng(n)   # seed changes each round as |labeled| grows
-        val_idx  = rng.choice(n, size=max(1, n // 5), replace=False)
-        tr_mask  = np.ones(n, dtype=bool);  tr_mask[val_idx] = False
-
-        parts_tr = {k: v[tr_mask]  for k, v in parts.items()}
-        parts_vl = {k: v[~tr_mask] for k, v in parts.items()}
-        y_tr, y_vl = y[tr_mask], y[~tr_mask]
-
         for k in self._KEYS:
-            self._surrogates[k].fit(parts_tr[k], y_tr, epochs=epochs, batch=batch)
-
-        # Weights from validation Spearman — properly reflects generalisation quality
-        rhos = []
-        for k in self._KEYS:
-            mu_vl, _ = self._surrogates[k].predict(parts_vl[k])
-            rhos.append(max(_spearman_np(mu_vl, y_vl), 0.0))
-
-        total = sum(rhos)
-        if total > 0:
-            self._weights = np.array(rhos) / total
-        else:
-            self._weights = np.ones(3) / 3
-
-        print(f"  [EnsembleFusion] weights — "
-              + "  ".join(f"{k}:{w:.3f}" for k, w in zip(self._KEYS, self._weights)))
+            self._surrogates[k].fit(parts[k], y, epochs=epochs, batch=batch)
 
     def predict(self, X: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         parts = X if isinstance(X, dict) else self._split(X)
         n     = len(next(iter(parts.values())))
 
-        # Weighted Borda: backbone with higher val-ρ contributes more to the ranking.
-        borda = np.zeros(n, dtype=np.float64)
-        for i, k in enumerate(self._KEYS):
+        all_ranks = []
+        for k in self._KEYS:
             mu, _ = self._surrogates[k].predict(parts[k])
             order = np.argsort(mu)[::-1]
-            ranks = np.empty(n)
+            ranks = np.empty(n, dtype=np.float64)
             ranks[order] = np.arange(1, n + 1)
-            borda += self._weights[i] * ranks
+            all_ranks.append(ranks / n)           # normalise to [0, 1]; 0 = best
 
-        return -borda.astype(np.float32), np.zeros(n, dtype=np.float32)
+        ranks_norm = np.stack(all_ranks)           # (3, N)
+        mu_borda   = ranks_norm.mean(axis=0)       # mean normalised rank, lower = better
+        sigma      = ranks_norm.std(axis=0)        # inter-model disagreement
+
+        ucb = -mu_borda + self._beta * sigma       # maximise: low rank + high uncertainty
+        return ucb.astype(np.float32), np.zeros(n, dtype=np.float32)
