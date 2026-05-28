@@ -183,8 +183,13 @@ class BackboneFinetuner:
         self._pool_dataset = DatasetGrover().prepare(config=cfg, partition="train")
         self._collator     = CollatorGrover(cfg)
         self._model        = GROVER(cfg).to(DEVICE)
-        self._emb_dim      = 2 * cfg.hidden_size   # mol_from_bond ++ mol_from_atom
         self._get_emb      = self._emb_grover
+
+        # Probe actual output dim — checkpoint hidden size may differ from cfg.hidden_size
+        with torch.no_grad():
+            _probe = self._collator([self._pool_dataset[0]])
+            _probe.to(DEVICE)
+            self._emb_dim = int(self._emb_grover(_probe).shape[-1])
 
     def _setup_unimol(self, dataset_name, pool_smiles, model_zoo):
         from muben.dataset import DatasetUniMol
