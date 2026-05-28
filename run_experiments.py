@@ -842,6 +842,23 @@ def main():
         # Restrict pool to molecules with oracle scores
         pool_smiles = [s for s in pool_smiles if s in oracle]
 
+        # ── Diagnostics ────────────────────────────────────────────────────────
+        scores_all = list(oracle.values())
+        print(f"\n[diag] Oracle score range: min={min(scores_all):.3f}  max={max(scores_all):.3f}  mean={np.mean(scores_all):.3f}")
+        print(f"       Scores are {'NEGATIVE (lower=better, raw docking ✓)' if max(scores_all) <= 0 else 'POSITIVE (higher=better — check _SIGN and _recall direction!)'}")
+
+        pool_set = set(pool_smiles)
+        sorted_oracle = sorted(oracle.items(), key=lambda x: x[1])
+        top500_smiles = [s for s, _ in sorted_oracle[:TOP_K]]
+        in_pool = sum(1 for s in top500_smiles if s in pool_set)
+        print(f"[diag] True top-{TOP_K} molecules in pool: {in_pool}/{TOP_K} ({in_pool/TOP_K:.0%})")
+        print(f"       Max achievable recall = {in_pool/TOP_K:.0%}")
+        if in_pool < TOP_K * 0.8:
+            print(f"       WARNING: {TOP_K - in_pool} top-{TOP_K} molecules are NOT in the pool!")
+            print(f"       Recall ceiling is {in_pool/TOP_K:.0%}, not 100%. Fix: rerun extract_embeddings.py.")
+        print()
+        # ── End diagnostics ────────────────────────────────────────────────────
+
         for name in models:
             for seed in args.seeds:
                 if args.force:

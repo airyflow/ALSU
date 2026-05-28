@@ -229,6 +229,8 @@ The backbone weights are updated at every AL round using the growing labeled set
 No pre-extracted embeddings are needed; embeddings are recomputed from the
 updated backbone after each finetuning step.
 
+**Run a single finetuned experiment:**
+
 ```bash
 python run_active_learning.py \
     --backbone              unimol \
@@ -239,6 +241,39 @@ python run_active_learning.py \
     --finetune-lr-backbone  1e-5 \
     --finetune-lr-head      1e-4
 ```
+
+**Run multiple backbones for comparison:**
+
+```bash
+# Run each backbone with finetuning (independently, can be run in any order)
+python run_active_learning.py --backbone unimol    --finetune --uq mc_dropout --acq ucb
+python run_active_learning.py --backbone grover    --finetune --uq mc_dropout --acq ucb
+python run_active_learning.py --backbone molformer --finetune --uq mc_dropout --acq ucb
+
+# Also run the static (non-finetuned) baselines for comparison
+python run_active_learning.py --backbone unimol    --uq mc_dropout --acq ucb
+python run_active_learning.py --backbone grover    --uq mc_dropout --acq ucb
+python run_active_learning.py --backbone molformer --uq mc_dropout --acq ucb
+```
+
+Already-finished runs are detected and skipped automatically.
+
+**Generate comparison plots:**
+
+```bash
+# Plots all static runs found in runs/al_{dataset}_*/ (non-finetuned only)
+python compare_backbones.py --plot-only
+
+# Or re-run static experiments and plot in one command
+python compare_backbones.py
+```
+
+> **Note:** `compare_backbones.py` only covers static (non-finetuned) runs and
+> produces PNG plots — not an HTML report.  Finetuned run results are saved to
+> `runs/al_{dataset}_{backbone}_{uq}_{acq}_finetuned/history.json` and can be
+> inspected directly.  An automated comparison between finetuned and static runs
+> is not yet scripted; `run_experiments.py --plot-only` (Workflow C) covers the
+> paper's model comparison with HTML report generation.
 
 **Finetuning arguments:**
 
