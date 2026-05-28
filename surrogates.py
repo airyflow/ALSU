@@ -197,8 +197,7 @@ class SingleBackboneMVESurrogate:
         self._ys = float(y.std()) + 1e-8
         y_norm   = (y - self._ym) / self._ys
 
-        # Re-initialise model weights each round for a clean fit
-        self._model = _DualMVEModel(self._in_dim, self._dropout).to(DEVICE)
+        # Warm-start from previous round's weights (model initialised in __init__)
         _train_model(self._model, X, y_norm, self._loss_fn, epochs, batch, self._lr)
 
     def predict(self, X: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -242,7 +241,7 @@ class LightweightMVESurrogate:
         self._ys = float(y.std()) + 1e-8
         y_norm   = (y - self._ym) / self._ys
 
-        self._model = _DualMVEModel(self._in_dim, self._dropout).to(DEVICE)
+        # Warm-start from previous round's weights (model initialised in __init__)
         _train_model(self._model, X, y_norm, self._loss_fn, epochs, batch, self._lr)
 
     def predict(self, X: np.ndarray) -> tuple[np.ndarray, np.ndarray]:

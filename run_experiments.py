@@ -63,7 +63,7 @@ INIT_SIZE  = 500
 BATCH_SIZE = 500
 N_ROUNDS   = 5
 TOP_K      = 500    # top-1% of 50 k ≈ 500
-EPOCHS     = 50     # surrogate training epochs per round
+EPOCHS     = 150    # surrogate training epochs per round (warm-start: ~300 steps round 1, ~1500 by round 5)
 SEED       = 42
 
 
