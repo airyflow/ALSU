@@ -379,7 +379,7 @@ EXPERIMENTS = {
     "mixed_3lt_2g":     (build_mixed_3lt_2g,     acq_ucb),
     "mixed_4lt_1g":     (build_mixed_4lt_1g,     acq_ucb),
     "bigfusion":        (build_bigfusion,         acq_borda),
-    "ensemble_fusion":  (build_ensemble_fusion,   acq_ucb),
+    "ensemble_fusion":  (build_ensemble_fusion,   acq_greedy),
 }
 
 
