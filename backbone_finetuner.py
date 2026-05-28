@@ -380,7 +380,7 @@ class BackboneFinetuner:
 
     # ── Embedding extraction ───────────────────────────────────────────────────
 
-    def extract_pool_embeddings(self, batch_size: int = 256) -> np.ndarray:
+    def extract_pool_embeddings(self, batch_size: int = 64) -> np.ndarray:
         """
         Run the (possibly finetuned) backbone over the full pool.
 
