@@ -49,6 +49,7 @@ from surrogates import (
     BigFusionSurrogate,
     EnsembleFusionSurrogate,
     LearnedFusionSurrogate,
+    NonlinearFusionSurrogate,
 )
 
 ROOT       = Path(__file__).resolve().parent
@@ -432,6 +433,11 @@ def build_learned_fusion(emb_dict):
     return [(N_ROUNDS, LearnedFusionSurrogate(dims=dims), "bigfusion")]
 
 
+def build_nonlinear_fusion(emb_dict):
+    dims = {k: emb_dict[k].shape[1] for k in ["grover", "molformer", "unimol"]}
+    return [(N_ROUNDS, NonlinearFusionSurrogate(dims=dims), "bigfusion")]
+
+
 EXPERIMENTS = {
     "molformer":        (build_molformer,        acq_ucb),
     "smallfusion_5lt":  (build_smallfusion_5lt,  acq_ucb),
@@ -439,8 +445,9 @@ EXPERIMENTS = {
     "mixed_4lt_1g":     (build_mixed_4lt_1g,     acq_ucb),
     "bigfusion":        (build_bigfusion,         acq_borda),
     "ensemble_fusion":  (build_ensemble_fusion,   acq_greedy),
-    "fixed_borda":      (build_fixed_borda,       acq_borda),
-    "learned_fusion":   (build_learned_fusion,    acq_greedy),
+    "fixed_borda":       (build_fixed_borda,       acq_borda),
+    "learned_fusion":    (build_learned_fusion,    acq_greedy),
+    "nonlinear_fusion":  (build_nonlinear_fusion,  acq_greedy),
 }
 
 # Experiments that use diversity-aware batch acquisition (k-means cluster + best-per-cluster)

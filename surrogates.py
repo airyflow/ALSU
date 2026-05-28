@@ -502,3 +502,139 @@ class LearnedFusionSurrogate:
             mu_out = mus.mean(axis=1).astype(np.float32)
 
         return mu_out, np.zeros(n, dtype=np.float32)
+
+
+# ── NonlinearFusionSurrogate ───────────────────────────────────────────────────
+
+class _FusionMLP(nn.Module):
+    """
+    Tiny nonlinear fusion head: 6 → 32 → 16 → 1 with GELU.
+    Input: [µ_g, σ_g, µ_m, σ_m, µ_u, σ_u]
+    """
+    def __init__(self, dropout: float = 0.15):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(6, 32), nn.GELU(), nn.Dropout(dropout),
+            nn.Linear(32, 16), nn.GELU(), nn.Dropout(dropout),
+            nn.Linear(16, 1),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x).squeeze(-1)
+
+
+class NonlinearFusionSurrogate:
+    """
+    Three backbone surrogates + tiny MLP meta-head trained on held-out data.
+
+    The MLP receives [µ_g, σ_g, µ_m, σ_m, µ_u, σ_u] — six features — so it
+    can learn conditional patterns like "trust UniMol more when MoLFormer's
+    σ is high" or "down-weight GROVER when its µ contradicts MoLFormer."
+    A linear meta-learner (LearnedFusion) cannot express these interactions.
+
+    fit() workflow (same 80/20 split as LearnedFusion):
+      1. Train backbone surrogates on 80% of labeled data.
+      2. Collect (µ, σ) from all three backbones on 20% holdout.
+      3. Train _FusionMLP on those 6-feature vectors → y_holdout.
+
+    predict() returns (µ_meta, zeros) — use with acq_greedy.
+
+    Parameters
+    ----------
+    dims       : dict {"grover": int, "molformer": int, "unimol": int}
+    meta_epochs: training epochs for the fusion MLP (default 500)
+    meta_lr    : learning rate for fusion MLP (default 3e-3)
+    """
+
+    _KEYS = ["grover", "molformer", "unimol"]
+
+    def __init__(
+        self,
+        dims: dict,
+        spearman_weight: float = 0.1,
+        lr: float              = 3e-4,
+        dropout: float         = 0.25,
+        meta_epochs: int       = 500,
+        meta_lr: float         = 3e-3,
+    ):
+        self._dims = dims
+        self._surrogates = {
+            k: SingleBackboneMVESurrogate(
+                in_dim          = dims[k],
+                spearman_weight = spearman_weight,
+                lr              = lr,
+                dropout         = dropout,
+            )
+            for k in self._KEYS
+        }
+        self._meta_epochs = meta_epochs
+        self._meta_lr     = meta_lr
+        self._mlp: _FusionMLP | None = None
+
+    def _split(self, X: np.ndarray) -> dict:
+        cuts = np.cumsum([self._dims[k] for k in self._KEYS])
+        splits = np.split(X, cuts[:-1], axis=1)
+        return {k: s for k, s in zip(self._KEYS, splits)}
+
+    def _backbone_features(self, parts: dict) -> np.ndarray:
+        """Stack [µ_g, σ_g, µ_m, σ_m, µ_u, σ_u] → (N, 6) float32."""
+        cols = []
+        for k in self._KEYS:
+            mu, sig = self._surrogates[k].predict(parts[k])
+            cols.extend([mu, sig])
+        return np.stack(cols, axis=1).astype(np.float32)
+
+    def fit(self, X: np.ndarray, y: np.ndarray, epochs: int = 50, batch: int = 256):
+        parts = X if isinstance(X, dict) else self._split(X)
+        n     = len(y)
+
+        # 80/20 holdout — MLP must see out-of-sample backbone predictions
+        rng     = np.random.default_rng(n)
+        val_idx = rng.choice(n, size=max(1, n // 5), replace=False)
+        tr_mask = np.ones(n, dtype=bool);  tr_mask[val_idx] = False
+
+        parts_tr = {k: v[tr_mask]  for k, v in parts.items()}
+        parts_vl = {k: v[~tr_mask] for k, v in parts.items()}
+        y_tr, y_vl = y[tr_mask], y[~tr_mask]
+
+        for k in self._KEYS:
+            self._surrogates[k].fit(parts_tr[k], y_tr, epochs=epochs, batch=batch)
+
+        # 6-feature matrix from holdout backbone predictions
+        X_vl = self._backbone_features(parts_vl)            # (n_val, 6)
+        Xt   = torch.tensor(X_vl).to(DEVICE)
+        yt   = torch.tensor(y_vl, dtype=torch.float32).to(DEVICE)
+
+        # Fresh MLP each round (small dataset, fast to train from scratch)
+        self._mlp = _FusionMLP().to(DEVICE)
+        opt = torch.optim.Adam(
+            self._mlp.parameters(), lr=self._meta_lr, weight_decay=1e-3
+        )
+
+        self._mlp.train()
+        for _ in range(self._meta_epochs):
+            opt.zero_grad()
+            F.mse_loss(self._mlp(Xt), yt).backward()
+            opt.step()
+
+        self._mlp.eval()
+        with torch.no_grad():
+            val_rho = _spearman_np(self._mlp(Xt).cpu().numpy(), y_vl)
+        print(f"  [NonlinearFusion] val Spearman ρ = {val_rho:.3f}  (n_val={len(y_vl)})")
+
+    def predict(self, X: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        parts = X if isinstance(X, dict) else self._split(X)
+        n     = len(next(iter(parts.values())))
+
+        if self._mlp is None:
+            return np.zeros(n, dtype=np.float32), np.zeros(n, dtype=np.float32)
+
+        feats = self._backbone_features(parts)               # (N, 6)
+        self._mlp.eval()
+        preds = []
+        with torch.no_grad():
+            for i in range(0, n, 4096):
+                xb = torch.tensor(feats[i : i + 4096]).to(DEVICE)
+                preds.append(self._mlp(xb).float().cpu().numpy())
+
+        return np.concatenate(preds), np.zeros(n, dtype=np.float32)
