@@ -736,6 +736,13 @@ class OOFFusionSurrogate:
             for i, k in enumerate(self._KEYS):
                 oof_mus[fold_vl, i] = fold_surrs[k].predict(parts_vl[k])[0]
 
+            # Explicitly free GPU memory before next fold
+            for s in fold_surrs.values():
+                del s._model
+            del fold_surrs
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
         # ── Step 2: Meta-learner on all OOF predictions ───────────────────────
         self._meta.fit(oof_mus, y)
         self._meta_fitted = True
