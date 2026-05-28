@@ -388,17 +388,12 @@ class EnsembleFusionSurrogate:
         parts = X if isinstance(X, dict) else self._split(X)
         n     = len(next(iter(parts.values())))
 
-        all_ranks = []
+        borda = np.zeros(n, dtype=np.float64)
         for k in self._KEYS:
             mu, _ = self._surrogates[k].predict(parts[k])
             order = np.argsort(mu)[::-1]
             ranks = np.empty(n, dtype=np.float64)
             ranks[order] = np.arange(1, n + 1)
-            all_ranks.append(ranks / n)           # normalise to [0, 1]; 0 = best
+            borda += ranks
 
-        ranks_norm = np.stack(all_ranks)           # (3, N)
-        mu_borda   = ranks_norm.mean(axis=0)       # mean normalised rank, lower = better
-        sigma      = ranks_norm.std(axis=0)        # inter-model disagreement
-
-        ucb = -mu_borda + self._beta * sigma       # maximise: low rank + high uncertainty
-        return ucb.astype(np.float32), np.zeros(n, dtype=np.float32)
+        return -borda.astype(np.float32), np.zeros(n, dtype=np.float32)

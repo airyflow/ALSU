@@ -38,6 +38,7 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+from sklearn.cluster import MiniBatchKMeans
 import matplotlib.pyplot as plt
 import matplotlib.ticker as mtick
 import torch
@@ -175,26 +176,28 @@ class Experiment:
 
     def __init__(
         self,
-        emb_dict:    dict,
-        pool_smiles: list,
-        oracle:      dict,
-        schedule:    list,
+        emb_dict:      dict,
+        pool_smiles:   list,
+        oracle:        dict,
+        schedule:      list,
         acq_fn,
-        run_dir:     Path,
-        init_size:   int = INIT_SIZE,
-        batch_size:  int = BATCH_SIZE,
-        epochs:      int = EPOCHS,
-        top_k:       int = TOP_K,
+        run_dir:       Path,
+        init_size:     int  = INIT_SIZE,
+        batch_size:    int  = BATCH_SIZE,
+        epochs:        int  = EPOCHS,
+        top_k:         int  = TOP_K,
+        diverse_batch: bool = False,
     ):
         self.emb_dict   = emb_dict
         self.smiles     = np.array(pool_smiles)
         self.oracle     = oracle
         self.schedule   = schedule   # [(n_rounds, surrogate, x_key), ...]
-        self.acq_fn     = acq_fn
-        self.run_dir    = run_dir
-        self.batch_size = batch_size
-        self.epochs     = epochs
-        self.top_k      = top_k
+        self.acq_fn        = acq_fn
+        self.run_dir       = run_dir
+        self.batch_size    = batch_size
+        self.epochs        = epochs
+        self.top_k         = top_k
+        self.diverse_batch = diverse_batch
         self.run_dir.mkdir(parents=True, exist_ok=True)
 
         # Pre-build fused embedding matrix
@@ -222,6 +225,40 @@ class Experiment:
             s for s, _ in sorted(self.oracle.items(), key=lambda x: x[1])[: self.top_k]
         )
         return sum(1 for s in self.labeled_scores if s in top_k_set) / self.top_k
+
+    def _diverse_acquire(self, pool_idx: np.ndarray, acq_scores: np.ndarray) -> np.ndarray:
+        """
+        Cluster unlabeled pool into batch_size groups (k-means on L2-normalised
+        MoLFormer embeddings), then pick the highest-scoring molecule per cluster.
+        Guarantees the acquired batch covers the full chemical diversity of
+        high-scoring candidates rather than clustering on one scaffold.
+        """
+        k   = min(self.batch_size, len(pool_idx))
+        emb = self.emb_dict["molformer"][pool_idx].astype(np.float32)
+
+        # L2-normalise so k-means uses cosine-like distances
+        norms = np.linalg.norm(emb, axis=1, keepdims=True) + 1e-8
+        emb   = emb / norms
+
+        km     = MiniBatchKMeans(n_clusters=k, random_state=0, n_init=3,
+                                 batch_size=min(4096, len(pool_idx)))
+        labels = km.fit_predict(emb)
+
+        selected_local = []
+        for c in range(k):
+            in_cluster = np.where(labels == c)[0]
+            if len(in_cluster) == 0:
+                continue
+            best = in_cluster[np.argmax(acq_scores[in_cluster])]
+            selected_local.append(best)
+
+        # Fill any empty-cluster gaps with the next-best unselected molecules
+        if len(selected_local) < self.batch_size:
+            chosen    = set(selected_local)
+            remaining = [i for i in np.argsort(acq_scores)[::-1] if i not in chosen]
+            selected_local.extend(remaining[: self.batch_size - len(selected_local)])
+
+        return pool_idx[np.array(selected_local)]
 
     def _get_X(self, x_key: str) -> np.ndarray:
         if x_key == "fused" or x_key == "bigfusion":
@@ -269,10 +306,13 @@ class Experiment:
                 pool_idx = np.where(mask)[0]
                 mu, sigma = surrogate.predict(X_all[pool_idx])
 
-                # 4. Acquire top-k
+                # 4. Acquire batch
                 acq_scores = self.acq_fn(mu, sigma)
-                top_local  = np.argsort(acq_scores)[::-1][: self.batch_size]
-                selected   = pool_idx[top_local]
+                if self.diverse_batch:
+                    selected = self._diverse_acquire(pool_idx, acq_scores)
+                else:
+                    top_local = np.argsort(acq_scores)[::-1][: self.batch_size]
+                    selected  = pool_idx[top_local]
 
                 # 5. Query oracle
                 for i in selected:
@@ -382,6 +422,9 @@ EXPERIMENTS = {
     "ensemble_fusion":  (build_ensemble_fusion,   acq_greedy),
 }
 
+# Experiments that use diversity-aware batch acquisition (k-means cluster + best-per-cluster)
+DIVERSE_BATCH_EXPERIMENTS = {"ensemble_fusion"}
+
 
 # ==============================================================================
 # RUNNER
@@ -405,12 +448,13 @@ def run_one(name: str, emb_dict: dict, pool_smiles: list, oracle: dict, seed: in
     torch.manual_seed(seed)
 
     exp = Experiment(
-        emb_dict    = emb_dict,
-        pool_smiles = pool_smiles,
-        oracle      = oracle,
-        schedule    = schedule,
-        acq_fn      = acq_fn,
-        run_dir     = run_dir,
+        emb_dict       = emb_dict,
+        pool_smiles    = pool_smiles,
+        oracle         = oracle,
+        schedule       = schedule,
+        acq_fn         = acq_fn,
+        run_dir        = run_dir,
+        diverse_batch  = name in DIVERSE_BATCH_EXPERIMENTS,
     )
     return exp.run()
 
