@@ -226,39 +226,46 @@ class Experiment:
         )
         return sum(1 for s in self.labeled_scores if s in top_k_set) / self.top_k
 
-    def _diverse_acquire(self, pool_idx: np.ndarray, acq_scores: np.ndarray) -> np.ndarray:
+    def _diverse_acquire(self, pool_idx: np.ndarray, acq_scores: np.ndarray,
+                         top_multiplier: int = 10) -> np.ndarray:
         """
-        Cluster unlabeled pool into batch_size groups (k-means on L2-normalised
-        MoLFormer embeddings), then pick the highest-scoring molecule per cluster.
-        Guarantees the acquired batch covers the full chemical diversity of
-        high-scoring candidates rather than clustering on one scaffold.
-        """
-        k   = min(self.batch_size, len(pool_idx))
-        emb = self.emb_dict["molformer"][pool_idx].astype(np.float32)
+        Pre-filter to the top-(batch_size × top_multiplier) candidates by acquisition
+        score, cluster those into batch_size groups (k-means on L2-normalised MoLFormer
+        embeddings), then pick the highest-scoring molecule per cluster.
 
-        # L2-normalise so k-means uses cosine-like distances
+        Clustering the full pool (~50k) is slow and counterproductive — most clusters
+        land in bad regions.  Restricting to the top-M keeps diversity within the
+        high-confidence region and runs ~10–50× faster.
+        """
+        k = min(self.batch_size, len(pool_idx))
+        m = min(k * top_multiplier, len(pool_idx))
+
+        # Pre-filter: indices into pool_idx of the top-m by acquisition score
+        top_m_local = np.argsort(acq_scores)[::-1][:m]   # local indices (into pool_idx)
+
+        emb   = self.emb_dict["molformer"][pool_idx[top_m_local]].astype(np.float32)
         norms = np.linalg.norm(emb, axis=1, keepdims=True) + 1e-8
         emb   = emb / norms
 
-        km     = MiniBatchKMeans(n_clusters=k, random_state=0, n_init=3,
-                                 batch_size=min(4096, len(pool_idx)))
+        km     = MiniBatchKMeans(n_clusters=k, random_state=0, n_init=1,
+                                 batch_size=min(4096, m))
         labels = km.fit_predict(emb)
 
-        selected_local = []
+        selected_in_top_m = []
         for c in range(k):
             in_cluster = np.where(labels == c)[0]
             if len(in_cluster) == 0:
                 continue
-            best = in_cluster[np.argmax(acq_scores[in_cluster])]
-            selected_local.append(best)
+            best = in_cluster[np.argmax(acq_scores[top_m_local[in_cluster]])]
+            selected_in_top_m.append(top_m_local[best])
 
-        # Fill any empty-cluster gaps with the next-best unselected molecules
-        if len(selected_local) < self.batch_size:
-            chosen    = set(selected_local)
-            remaining = [i for i in np.argsort(acq_scores)[::-1] if i not in chosen]
-            selected_local.extend(remaining[: self.batch_size - len(selected_local)])
+        # Fill empty-cluster gaps with next-best unselected from top-m
+        if len(selected_in_top_m) < k:
+            chosen    = set(selected_in_top_m)
+            remaining = [i for i in top_m_local if i not in chosen]
+            selected_in_top_m.extend(remaining[: k - len(selected_in_top_m)])
 
-        return pool_idx[np.array(selected_local)]
+        return pool_idx[np.array(selected_in_top_m)]
 
     def _get_X(self, x_key: str) -> np.ndarray:
         if x_key == "fused" or x_key == "bigfusion":
