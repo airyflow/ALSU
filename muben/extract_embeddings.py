@@ -7,8 +7,10 @@ Output: results/embed/Enamine50k/{backbone}_embeddings.npz
         row alignment is always self-documenting.
 """
 
+import datetime
 import os
 import sys
+import time
 import types
 import argparse
 import numpy as np
@@ -168,10 +170,11 @@ class MubenRuntimeConfig:
 # SAVE — always bundle SMILES + embeddings together
 # ==============================================================================
 
-def save_embeddings(name: str, matrix: np.ndarray, smiles: list[str]):
+def save_embeddings(name: str, matrix: np.ndarray, smiles: list[str]) -> dict:
     """
     Save as .npz so smiles[i] ↔ matrix[i] is guaranteed in one file.
     Also keep a .npy for any legacy code that expects it.
+    Returns a metadata dict for the timing CSV.
     """
     out_npz = OUT_DIR / f"{name}_embeddings.npz"
     out_npy = OUT_DIR / f"{name}_embeddings.npy"
@@ -182,6 +185,12 @@ def save_embeddings(name: str, matrix: np.ndarray, smiles: list[str]):
     print(f"[saved] {out_npz.name}  shape={matrix.shape}")
     print(f"        smiles[0]    = {smiles[0]}")
     print(f"        smiles[-1]   = {smiles[-1]}")
+
+    return {
+        "n_molecules":   matrix.shape[0],
+        "embedding_dim": matrix.shape[1],
+        "output_path":   str(out_npz),
+    }
 
 
 # ==============================================================================
@@ -232,7 +241,7 @@ def extract_grover(smiles: list[str]):
             embeddings.append(combined.float().cpu().numpy())
 
     matrix = np.vstack(embeddings)
-    save_embeddings("grover", matrix, smiles)
+    return save_embeddings("grover", matrix, smiles)
 
 
 def extract_unimol(smiles: list[str]):
@@ -305,7 +314,7 @@ def extract_unimol(smiles: list[str]):
             embeddings.append(feat.float().cpu().numpy())
 
     matrix = np.vstack(embeddings)
-    save_embeddings("unimol", matrix, smiles)
+    return save_embeddings("unimol", matrix, smiles)
 
 
 def extract_molformer(smiles: list[str]):
@@ -338,7 +347,7 @@ def extract_molformer(smiles: list[str]):
         embeddings.append(emb.cpu().numpy())
 
     matrix = np.vstack(embeddings)
-    save_embeddings("molformer", matrix, smiles)
+    return save_embeddings("molformer", matrix, smiles)
 
 
 # ==============================================================================
@@ -353,9 +362,53 @@ if __name__ == "__main__":
     import muben.dataset.dataset
     patch_muben_dataset(smiles)
 
-    # 3. Extract
-    extract_grover(smiles)
-    extract_unimol(smiles)
-    extract_molformer(smiles)
+    # 3. Extract — time each backbone and collect results
+    device_str = "cuda" if torch.cuda.is_available() else "cpu"
+    run_ts     = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
+    extractors = [
+        ("grover",    extract_grover),
+        ("unimol",    extract_unimol),
+        ("molformer", extract_molformer),
+    ]
+
+    records = []
+    total_t0 = time.perf_counter()
+
+    for backbone, fn in extractors:
+        t0   = time.perf_counter()
+        meta = fn(smiles)
+        elapsed = time.perf_counter() - t0
+
+        record = {
+            "timestamp":     run_ts,
+            "dataset":       DATASET,
+            "backbone":      backbone,
+            "n_molecules":   meta["n_molecules"],
+            "embedding_dim": meta["embedding_dim"],
+            "elapsed_s":     round(elapsed, 1),
+            "device":        device_str,
+            "output_path":   meta["output_path"],
+        }
+        records.append(record)
+        print(f"  [{backbone}] done in {elapsed:.1f}s")
+
+    total_elapsed = time.perf_counter() - total_t0
+    print(f"\n[done] Total extraction time: {total_elapsed:.1f}s")
+
+    # 4. Append to a human-readable log in results/
+    log_path = OUT_DIR.parent / "extraction_log.txt"   # results/embed/extraction_log.txt
+    with open(log_path, "a") as f:
+        f.write(f"\n=== {run_ts}  dataset={DATASET}  device={device_str} ===\n")
+        for r in records:
+            f.write(
+                f"  {r['backbone']:<12}"
+                f"  {r['n_molecules']:>6,} mol"
+                f"  {r['embedding_dim']:>5}d"
+                f"  {r['elapsed_s']:>8.1f}s"
+                f"  →  {r['output_path']}\n"
+            )
+        f.write(f"  {'total':<12}  {' ':>6}     {' ':>5}   {total_elapsed:>8.1f}s\n")
+
+    print(f"[log]  {log_path}")
     print(f"\n[done] Embeddings in {OUT_DIR}")
