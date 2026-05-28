@@ -28,6 +28,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, TensorDataset
 from sklearn.linear_model import RidgeCV
+from sklearn.model_selection import KFold
 
 from losses import CombinedLoss
 
@@ -638,3 +639,128 @@ class NonlinearFusionSurrogate:
                 preds.append(self._mlp(xb).float().cpu().numpy())
 
         return np.concatenate(preds), np.zeros(n, dtype=np.float32)
+
+
+# ── OOFFusionSurrogate ─────────────────────────────────────────────────────────
+
+class OOFFusionSurrogate:
+    """
+    K-fold out-of-fold (OOF) stacking: every labeled molecule gets an honest
+    out-of-sample backbone prediction, the RidgeCV meta-learner is fitted on
+    all N OOF predictions, then the main surrogates are retrained on 100% of
+    the labeled data.
+
+    Unlike LearnedFusion / NonlinearFusion (80/20 holdout), no labels are
+    sacrificed — the backbone surrogates always see the full labeled set.
+
+    fit() workflow:
+      1. K-fold split of labeled data.
+      2. For each fold: train fresh backbone surrogates on K-1 folds,
+         predict µ on the held-out fold → collect OOF predictions.
+      3. Fit RidgeCV on all N OOF [µ_g, µ_m, µ_u] → y.
+      4. Retrain main surrogates (warm-start) on 100% of labeled data.
+
+    Fold surrogates are trained for fold_epoch_frac × epochs (default 1/3)
+    to keep runtime similar to the 80/20-holdout variants.
+    Fresh initialization per fold avoids warm-start data leakage into OOF.
+
+    predict() returns (µ_meta, zeros) — use with acq_greedy.
+
+    Parameters
+    ----------
+    dims            : dict {"grover": int, "molformer": int, "unimol": int}
+    n_folds         : number of CV folds (default 3)
+    fold_epoch_frac : fraction of epochs used for fold models (default 0.33)
+    """
+
+    _KEYS = ["grover", "molformer", "unimol"]
+
+    def __init__(
+        self,
+        dims: dict,
+        spearman_weight: float  = 0.1,
+        lr: float               = 3e-4,
+        dropout: float          = 0.25,
+        n_folds: int            = 3,
+        fold_epoch_frac: float  = 0.33,
+    ):
+        self._dims            = dims
+        self._spearman_weight = spearman_weight
+        self._lr              = lr
+        self._dropout         = dropout
+        self._n_folds         = n_folds
+        self._fold_epoch_frac = fold_epoch_frac
+        self._surrogates = {
+            k: SingleBackboneMVESurrogate(
+                in_dim          = dims[k],
+                spearman_weight = spearman_weight,
+                lr              = lr,
+                dropout         = dropout,
+            )
+            for k in self._KEYS
+        }
+        self._meta = RidgeCV(alphas=[0.01, 0.1, 1.0, 10.0, 100.0])
+        self._meta_fitted = False
+
+    def _split(self, X: np.ndarray) -> dict:
+        cuts = np.cumsum([self._dims[k] for k in self._KEYS])
+        splits = np.split(X, cuts[:-1], axis=1)
+        return {k: s for k, s in zip(self._KEYS, splits)}
+
+    def fit(self, X: np.ndarray, y: np.ndarray, epochs: int = 50, batch: int = 256):
+        parts = X if isinstance(X, dict) else self._split(X)
+        n     = len(y)
+        fold_epochs = max(20, int(epochs * self._fold_epoch_frac))
+
+        # ── Step 1: K-fold OOF backbone predictions ───────────────────────────
+        oof_mus = np.zeros((n, 3), dtype=np.float32)
+        kf = KFold(n_splits=self._n_folds, shuffle=True, random_state=n)
+
+        for fold_tr, fold_vl in kf.split(np.arange(n)):
+            parts_tr = {k: v[fold_tr] for k, v in parts.items()}
+            parts_vl = {k: v[fold_vl] for k, v in parts.items()}
+            y_tr     = y[fold_tr]
+
+            # Fresh surrogates per fold — no warm-start to avoid data leakage
+            fold_surrs = {
+                k: SingleBackboneMVESurrogate(
+                    in_dim          = self._dims[k],
+                    spearman_weight = self._spearman_weight,
+                    lr              = self._lr,
+                    dropout         = self._dropout,
+                )
+                for k in self._KEYS
+            }
+            for k in self._KEYS:
+                fold_surrs[k].fit(parts_tr[k], y_tr, epochs=fold_epochs, batch=batch)
+            for i, k in enumerate(self._KEYS):
+                oof_mus[fold_vl, i] = fold_surrs[k].predict(parts_vl[k])[0]
+
+        # ── Step 2: Meta-learner on all OOF predictions ───────────────────────
+        self._meta.fit(oof_mus, y)
+        self._meta_fitted = True
+
+        oof_rho  = _spearman_np(self._meta.predict(oof_mus), y)
+        coef_str = "  ".join(f"{k}:{c:.3f}" for k, c in
+                              zip(self._KEYS, self._meta.coef_))
+        print(f"  [OOFFusion] coef — {coef_str}  "
+              f"bias:{self._meta.intercept_:.3f}  OOF ρ={oof_rho:.3f}")
+
+        # ── Step 3: Retrain main surrogates on 100% data (warm-start) ─────────
+        for k in self._KEYS:
+            self._surrogates[k].fit(parts[k], y, epochs=epochs, batch=batch)
+
+    def predict(self, X: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        parts = X if isinstance(X, dict) else self._split(X)
+        n     = len(next(iter(parts.values())))
+
+        mus = np.stack(
+            [self._surrogates[k].predict(parts[k])[0] for k in self._KEYS], axis=1
+        )  # (N, 3)
+
+        if self._meta_fitted:
+            mu_out = self._meta.predict(mus).astype(np.float32)
+        else:
+            mu_out = mus.mean(axis=1).astype(np.float32)
+
+        return mu_out, np.zeros(n, dtype=np.float32)
