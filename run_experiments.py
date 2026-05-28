@@ -858,8 +858,14 @@ def main():
     if not args.plot_only:
         emb_dict, pool_smiles = load_all_embeddings()
         oracle = load_oracle()
-        # Restrict pool to molecules with oracle scores
-        pool_smiles = [s for s in pool_smiles if s in oracle]
+        # Restrict pool to molecules with oracle scores — re-index emb_dict together
+        # so that emb_dict[bb][i] always corresponds to pool_smiles[i].
+        in_oracle = np.array([s in oracle for s in pool_smiles], dtype=bool)
+        keep      = np.where(in_oracle)[0]
+        pool_smiles = [pool_smiles[i] for i in keep]
+        emb_dict    = {bb: mat[keep] for bb, mat in emb_dict.items()}
+        print(f"[pool] {len(pool_smiles):,} molecules after oracle filter "
+              f"({len(keep):,} kept / {(~in_oracle).sum():,} dropped — no score)")
 
         # ── Diagnostics ────────────────────────────────────────────────────────
         scores_all = list(oracle.values())
