@@ -384,15 +384,25 @@ class EnsembleFusionSurrogate:
 
     def fit(self, X: np.ndarray, y: np.ndarray, epochs: int = 50, batch: int = 256):
         parts = X if isinstance(X, dict) else self._split(X)
+        n     = len(y)
+
+        # 80/20 holdout so val-ρ is honest (training ρ ≈ 0.99 for all backbones).
+        rng      = np.random.default_rng(n)   # seed changes each round as |labeled| grows
+        val_idx  = rng.choice(n, size=max(1, n // 5), replace=False)
+        tr_mask  = np.ones(n, dtype=bool);  tr_mask[val_idx] = False
+
+        parts_tr = {k: v[tr_mask]  for k, v in parts.items()}
+        parts_vl = {k: v[~tr_mask] for k, v in parts.items()}
+        y_tr, y_vl = y[tr_mask], y[~tr_mask]
 
         for k in self._KEYS:
-            self._surrogates[k].fit(parts[k], y, epochs=epochs, batch=batch)
+            self._surrogates[k].fit(parts_tr[k], y_tr, epochs=epochs, batch=batch)
 
-        # Recompute weights as normalised training-set Spearman correlations
+        # Weights from validation Spearman — properly reflects generalisation quality
         rhos = []
         for k in self._KEYS:
-            mu_tr, _ = self._surrogates[k].predict(parts[k])
-            rhos.append(max(_spearman_np(mu_tr, y), 0.0))  # clamp negative to 0
+            mu_vl, _ = self._surrogates[k].predict(parts_vl[k])
+            rhos.append(max(_spearman_np(mu_vl, y_vl), 0.0))
 
         total = sum(rhos)
         if total > 0:
@@ -405,26 +415,15 @@ class EnsembleFusionSurrogate:
 
     def predict(self, X: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         parts = X if isinstance(X, dict) else self._split(X)
-        n = len(next(iter(parts.values())))
+        n     = len(next(iter(parts.values())))
 
-        mus = []
-        for k in self._KEYS:
+        # Weighted Borda: backbone with higher val-ρ contributes more to the ranking.
+        borda = np.zeros(n, dtype=np.float64)
+        for i, k in enumerate(self._KEYS):
             mu, _ = self._surrogates[k].predict(parts[k])
-            mus.append(mu)
+            order = np.argsort(mu)[::-1]
+            ranks = np.empty(n)
+            ranks[order] = np.arange(1, n + 1)
+            borda += self._weights[i] * ranks
 
-        # Convert each backbone's predictions to percentile ranks in [0, 1].
-        # This makes the combination scale-invariant (like Borda count) while
-        # keeping a continuous signal for both mean and uncertainty estimation.
-        rank_mus = np.stack([
-            np.argsort(np.argsort(mu)).astype(np.float32) / max(n - 1, 1)
-            for mu in mus
-        ])  # (3, N)
-
-        # Weighted mean percentile rank — higher = better predicted binder
-        w       = self._weights[:, None]          # (3, 1)
-        mu_ens  = (rank_mus * w).sum(axis=0)      # (N,)
-
-        # Inter-model rank disagreement as epistemic uncertainty
-        sig_ens = np.sqrt((w * (rank_mus - mu_ens[None, :]) ** 2).sum(axis=0))
-
-        return mu_ens.astype(np.float32), sig_ens.astype(np.float32)
+        return -borda.astype(np.float32), np.zeros(n, dtype=np.float32)
