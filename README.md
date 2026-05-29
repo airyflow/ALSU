@@ -159,12 +159,16 @@ python muben/extract_embeddings.py
 
 Measured runtimes on **NVIDIA RTX 6000 Ada (48 GB)**, Enamine50k (50,240 molecules):
 
-| Backbone | Embedding dim | Time |
-|---|---|---|
-| GROVER | 1600 | 211 s (~3.5 min) |
-| Uni-Mol | 512 | 41 s |
-| MoLFormer | 768 | 15 s |
-| **Total** | | **~267 s (~4.5 min)** |
+| Backbone | Embedding dim | First run | Subsequent runs |
+|---|---|---|---|
+| GROVER | 1600 | ~211 s | ~211 s |
+| Uni-Mol | 512 | ~10–15 min † | ~41 s |
+| MoLFormer | 768 | ~15 s | ~15 s |
+| **Total** | | **~15–20 min** | **~267 s (~4.5 min)** |
+
+† Uni-Mol must generate 3D conformers (RDKit ETKDG) for every molecule on the
+first run. These are cached to `results/embed/Enamine50k/` so subsequent runs
+skip conformer generation entirely and take only ~41 s.
 
 Runtimes scale roughly linearly with pool size and inversely with GPU memory.
 Timing is logged automatically to `results/embed/extraction_log.txt` after each run.
