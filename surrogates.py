@@ -771,3 +771,134 @@ class OOFFusionSurrogate:
             mu_out = mus.mean(axis=1).astype(np.float32)
 
         return mu_out, np.zeros(n, dtype=np.float32)
+
+
+# ── LightweightMoLFormerScheduleSurrogate ─────────────────────────────────────
+
+class LightweightMoLFormerScheduleSurrogate:
+    """
+    Two-phase scheduled surrogate:
+
+    Phase 1 — first n_lt_rounds fit() calls:
+        Train the Lightweight MLP head on frozen concatenated embeddings
+        [GROVER_frozen | MoLFormer_frozen | UniMol_frozen].
+
+    Phase 2 — remaining fit() calls:
+        1. Finetune MoLFormer backbone on accumulated labeled data
+           (BackboneFinetuner with small lr to avoid catastrophic forgetting).
+        2. Re-extract MoLFormer embeddings for the full pool.
+        3. Signal Experiment to rebuild its fused matrix with the new embeddings.
+        4. The Lightweight MLP head stays FROZEN — no weight updates.
+           Acquisition uses the frozen head's output on the improved embeddings.
+
+    Rationale: early rounds have too few labels to finetune a large language
+    model without overfitting; the frozen-embedding MLP provides a stable,
+    fast surrogate.  Once enough labels accumulate, finetuning MoLFormer
+    produces more task-specific embeddings that the already-calibrated MLP
+    head can exploit without retraining.
+
+    Parameters
+    ----------
+    dims         : {"grover": D_g, "molformer": D_m, "unimol": D_u}
+    pool_smiles  : ordered list of all pool SMILES (MoLFormer re-extraction order)
+    emb_dict     : mutable reference to Experiment.emb_dict; "molformer" key is
+                   updated in-place after each finetune round
+    dataset_name : e.g. "Enamine50k"
+    n_lt_rounds  : lightweight rounds before switching to finetune (default 3)
+    ft_epochs    : MoLFormer finetune epochs per round (default 10)
+    ft_lr_bb     : backbone learning rate (small; default 1e-5)
+    ft_lr_head   : regression head lr for finetuner (default 1e-4)
+    """
+
+    needs_smiles = True   # Experiment will pass labeled_smiles to fit()
+
+    def __init__(
+        self,
+        dims: dict,
+        pool_smiles: list,
+        emb_dict: dict,
+        dataset_name: str   = "Enamine50k",
+        n_lt_rounds: int    = 3,
+        ft_epochs: int      = 10,
+        ft_lr_bb: float     = 1e-5,
+        ft_lr_head: float   = 1e-4,
+        spearman_weight: float = 0.1,
+        lr: float              = 3e-4,
+        dropout: float         = 0.25,
+    ):
+        self._dims         = dims
+        self._pool_smiles  = pool_smiles
+        self._emb_dict     = emb_dict
+        self._dataset_name = dataset_name
+        self._n_lt         = n_lt_rounds
+        self._ft_epochs    = ft_epochs
+        self._ft_lr_bb     = ft_lr_bb
+        self._ft_lr_head   = ft_lr_head
+        self._round_count  = 0
+
+        total_dim = sum(dims[k] for k in ["grover", "molformer", "unimol"])
+        self._lightweight = LightweightMVESurrogate(
+            in_dim          = total_dim,
+            spearman_weight = spearman_weight,
+            lr              = lr,
+            dropout         = dropout,
+        )
+
+        self._finetuner = None           # lazy-init (loading MoLFormer is expensive)
+        self.embeddings_refreshed = False # Experiment checks this after fit()
+
+    def fit(
+        self,
+        X: np.ndarray,
+        y: np.ndarray,
+        epochs: int = 50,
+        batch: int  = 256,
+        labeled_smiles: list | None = None,
+    ):
+        self._round_count += 1
+
+        if self._round_count <= self._n_lt:
+            # ── Phase 1: train Lightweight MLP ────────────────────────────────
+            self._lightweight.fit(X, y, epochs=epochs, batch=batch)
+
+        else:
+            # ── Phase 2: finetune MoLFormer ───────────────────────────────────
+            assert labeled_smiles is not None, (
+                "LightweightMoLFormerScheduleSurrogate needs labeled_smiles in phase 2"
+            )
+
+            # Load MoLFormer into the finetuner once (model stays in memory)
+            if self._finetuner is None:
+                from backbone_finetuner import BackboneFinetuner
+                self._finetuner = BackboneFinetuner(
+                    backbone     = "molformer",
+                    dataset_name = self._dataset_name,
+                    pool_smiles  = self._pool_smiles,
+                )
+
+            # y is _SIGN * oracle_score (positive, higher = better).
+            # BackboneFinetuner normalises labels internally, so sign doesn't matter.
+            self._finetuner.finetune(
+                labeled_smiles = labeled_smiles,
+                labeled_scores = y,
+                n_epochs       = self._ft_epochs,
+                batch_size     = 32,
+                lr_backbone    = self._ft_lr_bb,
+                lr_head        = self._ft_lr_head,
+            )
+
+            # Re-extract full-pool MoLFormer embeddings with finetuned weights
+            new_molf = self._finetuner.extract_pool_embeddings(batch_size=256)
+            self._emb_dict["molformer"] = new_molf   # update shared dict in-place
+
+            # Signal Experiment to rebuild self._fused / self._bigfusion
+            self.embeddings_refreshed = True
+
+            print(f"  [3lt2mf] MoLFormer finetuned & re-extracted. "
+                  f"shape={new_molf.shape}")
+            # MLP head is FROZEN — no fit() call
+
+    def predict(self, X: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        # X is a slice of the (possibly refreshed) fused matrix passed by Experiment.
+        # After embeddings_refreshed is handled, X contains updated MoLFormer columns.
+        return self._lightweight.predict(X)

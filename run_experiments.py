@@ -51,6 +51,7 @@ from surrogates import (
     LearnedFusionSurrogate,
     NonlinearFusionSurrogate,
     OOFFusionSurrogate,
+    LightweightMoLFormerScheduleSurrogate,
 )
 
 ROOT       = Path(__file__).resolve().parent
@@ -294,8 +295,26 @@ class Experiment:
                     dtype=np.float32,
                 )
 
-                # 2. Fit surrogate
-                surrogate.fit(X_tr, y_tr, epochs=self.epochs)
+                # 2. Fit surrogate — pass labeled SMILES for backbones that finetune
+                if getattr(surrogate, 'needs_smiles', False):
+                    labeled_smiles = self.smiles[idx].tolist()
+                    surrogate.fit(X_tr, y_tr, epochs=self.epochs,
+                                  labeled_smiles=labeled_smiles)
+                else:
+                    surrogate.fit(X_tr, y_tr, epochs=self.epochs)
+
+                # 2a. Rebuild fused matrix if surrogate updated backbone embeddings
+                if getattr(surrogate, 'embeddings_refreshed', False):
+                    surrogate.embeddings_refreshed = False
+                    self._fused = np.concatenate([
+                        self.emb_dict["grover"],
+                        self.emb_dict["molformer"],
+                        self.emb_dict["unimol"],
+                    ], axis=1)
+                    self._bigfusion = self._fused
+                    if x_key in ("fused", "bigfusion"):
+                        X_all = self._fused
+                    X_tr = X_all[idx]   # refresh so diagnostics use new embeddings
 
                 # ── Surrogate quality diagnostics ────────────────────────────
                 mu_tr, _  = surrogate.predict(X_tr)
@@ -375,73 +394,73 @@ def _fused_dim(emb_dict):
     return sum(emb_dict[k].shape[1] for k in ["grover", "molformer", "unimol"])
 
 
-def build_molformer(emb_dict):
-    return [(
-        N_ROUNDS,
-        SingleBackboneMVESurrogate(in_dim=emb_dict["molformer"].shape[1]),
-        "molformer",
-    )]
+def build_molformer(emb_dict, **kw):
+    return [(N_ROUNDS, SingleBackboneMVESurrogate(in_dim=emb_dict["molformer"].shape[1]), "molformer")]
 
 
-def build_smallfusion_5lt(emb_dict):
-    return [(
-        N_ROUNDS,
-        LightweightMVESurrogate(in_dim=_fused_dim(emb_dict)),
-        "fused",
-    )]
+def build_smallfusion_5lt(emb_dict, **kw):
+    return [(N_ROUNDS, LightweightMVESurrogate(in_dim=_fused_dim(emb_dict)), "fused")]
 
 
-def build_mixed_3lt_2g(emb_dict):
+def build_mixed_3lt_2g(emb_dict, **kw):
     return [
         (3, LightweightMVESurrogate(in_dim=_fused_dim(emb_dict)), "fused"),
         (2, SingleBackboneMVESurrogate(in_dim=emb_dict["grover"].shape[1]), "grover"),
     ]
 
 
-def build_mixed_4lt_1g(emb_dict):
+def build_mixed_4lt_1g(emb_dict, **kw):
     return [
         (4, LightweightMVESurrogate(in_dim=_fused_dim(emb_dict)), "fused"),
         (1, SingleBackboneMVESurrogate(in_dim=emb_dict["grover"].shape[1]), "grover"),
     ]
 
 
-def build_bigfusion(emb_dict):
+def build_bigfusion(emb_dict, **kw):
     dims = {k: emb_dict[k].shape[1] for k in ["grover", "molformer", "unimol"]}
-    return [(
-        N_ROUNDS,
-        BigFusionSurrogate(dims=dims),
-        "bigfusion",
-    )]
+    return [(N_ROUNDS, BigFusionSurrogate(dims=dims), "bigfusion")]
 
 
-def build_ensemble_fusion(emb_dict):
+def build_ensemble_fusion(emb_dict, **kw):
     dims = {k: emb_dict[k].shape[1] for k in ["grover", "molformer", "unimol"]}
-    return [(
-        N_ROUNDS,
-        EnsembleFusionSurrogate(dims=dims),
-        "bigfusion",   # same fused embedding input as bigfusion
-    )]
+    return [(N_ROUNDS, EnsembleFusionSurrogate(dims=dims), "bigfusion")]
 
 
-def build_fixed_borda(emb_dict):
+def build_fixed_borda(emb_dict, **kw):
     dims    = {k: emb_dict[k].shape[1] for k in ["grover", "molformer", "unimol"]}
     weights = {"grover": 0.1, "molformer": 0.7, "unimol": 0.2}
     return [(N_ROUNDS, BigFusionSurrogate(dims=dims, weights=weights), "bigfusion")]
 
 
-def build_learned_fusion(emb_dict):
+def build_learned_fusion(emb_dict, **kw):
     dims = {k: emb_dict[k].shape[1] for k in ["grover", "molformer", "unimol"]}
     return [(N_ROUNDS, LearnedFusionSurrogate(dims=dims), "bigfusion")]
 
 
-def build_nonlinear_fusion(emb_dict):
+def build_nonlinear_fusion(emb_dict, **kw):
     dims = {k: emb_dict[k].shape[1] for k in ["grover", "molformer", "unimol"]}
     return [(N_ROUNDS, NonlinearFusionSurrogate(dims=dims), "bigfusion")]
 
 
-def build_oof_fusion(emb_dict):
+def build_oof_fusion(emb_dict, **kw):
     dims = {k: emb_dict[k].shape[1] for k in ["grover", "molformer", "unimol"]}
     return [(N_ROUNDS, OOFFusionSurrogate(dims=dims), "bigfusion")]
+
+
+def build_3lt_2mf(emb_dict, pool_smiles=None, **kw):
+    """3 Lightweight frozen rounds, then 2 MoLFormer-finetune rounds."""
+    dims = {k: emb_dict[k].shape[1] for k in ["grover", "molformer", "unimol"]}
+    return [(
+        5,
+        LightweightMoLFormerScheduleSurrogate(
+            dims         = dims,
+            pool_smiles  = pool_smiles or [],
+            emb_dict     = emb_dict,
+            dataset_name = DATASET,
+            n_lt_rounds  = 3,
+        ),
+        "fused",
+    )]
 
 
 EXPERIMENTS = {
@@ -455,6 +474,7 @@ EXPERIMENTS = {
     "learned_fusion":    (build_learned_fusion,    acq_greedy),
     "nonlinear_fusion":  (build_nonlinear_fusion,  acq_greedy),
     "oof_fusion":        (build_oof_fusion,         acq_greedy),
+    "3lt_2mf":           (build_3lt_2mf,            acq_greedy),
 }
 
 # Experiments that use diversity-aware batch acquisition (k-means cluster + best-per-cluster)
@@ -467,7 +487,7 @@ DIVERSE_BATCH_EXPERIMENTS = {"ensemble_fusion"}
 
 def run_one(name: str, emb_dict: dict, pool_smiles: list, oracle: dict, seed: int):
     build_fn, acq_fn = EXPERIMENTS[name]
-    schedule = build_fn(emb_dict)
+    schedule = build_fn(emb_dict, pool_smiles=pool_smiles)
     run_dir  = RUNS_DIR / f"exp_{DATASET}_{name}_seed{seed}"
 
     history_path = run_dir / "history.json"
