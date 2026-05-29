@@ -157,20 +157,24 @@ This is the most time-consuming step but only needs to be done once.
 python muben/extract_embeddings.py
 ```
 
-Expected runtimes on a single A100 GPU:
+Measured runtimes on **NVIDIA RTX 6000 Ada (48 GB)**, Enamine50k (50,240 molecules):
 
-| Backbone | Time |
-|---|---|
-| GROVER | ~7 min (5 min features + 2 min embeddings) |
-| MoLFormer | ~6 min |
-| Uni-Mol | ~12 min (includes 3D conformer generation) |
-| **Total** | **~25 min** |
+| Backbone | Embedding dim | Time |
+|---|---|---|
+| GROVER | 1600 | 211 s (~3.5 min) |
+| Uni-Mol | 512 | 41 s |
+| MoLFormer | 768 | 15 s |
+| **Total** | | **~267 s (~4.5 min)** |
+
+Runtimes scale roughly linearly with pool size and inversely with GPU memory.
+Timing is logged automatically to `results/embed/extraction_log.txt` after each run.
 
 Output files:
 ```
 results/embed/Enamine50k/grover_embeddings.npz
 results/embed/Enamine50k/molformer_embeddings.npz
 results/embed/Enamine50k/unimol_embeddings.npz
+results/embed/extraction_log.txt
 ```
 Each `.npz` contains two arrays: `embeddings` (N × D) and `smiles` (N,) so that
 row alignment is always self-documenting.
