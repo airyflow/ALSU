@@ -844,7 +844,8 @@ class LightweightMoLFormerScheduleSurrogate:
             dropout         = dropout,
         )
 
-        self._finetuner = None           # lazy-init (loading MoLFormer is expensive)
+        self._finetuner  = None           # lazy-init (loading MoLFormer is expensive)
+        self._smi2idx    = {s: i for i, s in enumerate(pool_smiles)}
         self.embeddings_refreshed = False # Experiment checks this after fit()
 
     def fit(
@@ -891,12 +892,22 @@ class LightweightMoLFormerScheduleSurrogate:
             new_molf = self._finetuner.extract_pool_embeddings(batch_size=256)
             self._emb_dict["molformer"] = new_molf   # update shared dict in-place
 
-            # Signal Experiment to rebuild self._fused / self._bigfusion
-            self.embeddings_refreshed = True
-
             print(f"  [3lt2mf] MoLFormer finetuned & re-extracted. "
                   f"shape={new_molf.shape}")
-            # MLP head is FROZEN — no fit() call
+
+            # Rebuild X_tr with updated MoLFormer columns and retrain the MLP head.
+            # The head starts from its round-3 weights (warm-start) and adapts quickly
+            # to the new embedding distribution rather than discarding prior learning.
+            pool_idx  = np.array([self._smi2idx[s] for s in labeled_smiles])
+            new_X_tr  = np.concatenate([
+                self._emb_dict["grover"][pool_idx],
+                new_molf[pool_idx],
+                self._emb_dict["unimol"][pool_idx],
+            ], axis=1)
+            self._lightweight.fit(new_X_tr, y, epochs=epochs, batch=batch)
+
+            # Signal Experiment to rebuild X_all for diagnostics + acquisition
+            self.embeddings_refreshed = True
 
     def predict(self, X: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         # X is a slice of the (possibly refreshed) fused matrix passed by Experiment.
