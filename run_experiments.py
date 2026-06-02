@@ -52,6 +52,8 @@ from surrogates import (
     NonlinearFusionSurrogate,
     OOFFusionSurrogate,
     LightweightMoLFormerScheduleSurrogate,
+    SingleBackboneFinetuneScheduleSurrogate,
+    FTFusionSurrogate,
 )
 
 ROOT       = Path(__file__).resolve().parent
@@ -463,6 +465,74 @@ def build_3lt_2mf(emb_dict, pool_smiles=None, **kw):
     )]
 
 
+def build_ft_molformer(emb_dict, pool_smiles=None, **kw):
+    """2 frozen rounds, then 3 MoLFormer-finetune rounds."""
+    return [(
+        N_ROUNDS,
+        SingleBackboneFinetuneScheduleSurrogate(
+            backbone     = "molformer",
+            in_dim       = emb_dict["molformer"].shape[1],
+            pool_smiles  = pool_smiles or [],
+            emb_dict     = emb_dict,
+            dataset_name = DATASET,
+            n_ft_delay   = 2,
+            ft_epochs    = 10,
+        ),
+        "molformer",
+    )]
+
+
+def build_ft_grover(emb_dict, pool_smiles=None, **kw):
+    """2 frozen rounds, then 3 GROVER-finetune rounds."""
+    return [(
+        N_ROUNDS,
+        SingleBackboneFinetuneScheduleSurrogate(
+            backbone     = "grover",
+            in_dim       = emb_dict["grover"].shape[1],
+            pool_smiles  = pool_smiles or [],
+            emb_dict     = emb_dict,
+            dataset_name = DATASET,
+            n_ft_delay   = 2,
+            ft_epochs    = 10,
+        ),
+        "grover",
+    )]
+
+
+def build_ft_unimol(emb_dict, pool_smiles=None, **kw):
+    """2 frozen rounds, then 3 UniMol-finetune rounds."""
+    return [(
+        N_ROUNDS,
+        SingleBackboneFinetuneScheduleSurrogate(
+            backbone     = "unimol",
+            in_dim       = emb_dict["unimol"].shape[1],
+            pool_smiles  = pool_smiles or [],
+            emb_dict     = emb_dict,
+            dataset_name = DATASET,
+            n_ft_delay   = 2,
+            ft_epochs    = 10,
+        ),
+        "unimol",
+    )]
+
+
+def build_ft_fusion(emb_dict, pool_smiles=None, **kw):
+    """2 frozen rounds, then 3 all-backbone-finetune rounds."""
+    dims = {k: emb_dict[k].shape[1] for k in ["grover", "molformer", "unimol"]}
+    return [(
+        N_ROUNDS,
+        FTFusionSurrogate(
+            dims         = dims,
+            pool_smiles  = pool_smiles or [],
+            emb_dict     = emb_dict,
+            dataset_name = DATASET,
+            n_ft_delay   = 2,
+            ft_epochs    = 8,
+        ),
+        "fused",
+    )]
+
+
 EXPERIMENTS = {
     "molformer":        (build_molformer,        acq_ucb),
     "smallfusion_5lt":  (build_smallfusion_5lt,  acq_ucb),
@@ -475,6 +545,10 @@ EXPERIMENTS = {
     "nonlinear_fusion":  (build_nonlinear_fusion,  acq_greedy),
     "oof_fusion":        (build_oof_fusion,         acq_greedy),
     "3lt_2mf":           (build_3lt_2mf,            acq_greedy),
+    "ft_molformer":      (build_ft_molformer,      acq_ucb),
+    "ft_grover":         (build_ft_grover,         acq_ucb),
+    "ft_unimol":         (build_ft_unimol,         acq_ucb),
+    "ft_fusion":         (build_ft_fusion,         acq_greedy),
 }
 
 # Experiments that use diversity-aware batch acquisition (k-means cluster + best-per-cluster)
@@ -525,6 +599,10 @@ COLORS = {
     "mixed_4lt_1g":     "#E74C3C",
     "bigfusion":        "#6DBF87",
     "ensemble_fusion":  "#F1C40F",
+    "ft_molformer":     "#FF6B9D",
+    "ft_grover":        "#4ECDC4",
+    "ft_unimol":        "#95E1D3",
+    "ft_fusion":        "#FFA07A",
 }
 LABELS = {
     "molformer":        "Molformer",
@@ -533,6 +611,10 @@ LABELS = {
     "mixed_4lt_1g":     "Mixed(4LT+1G)",
     "bigfusion":        "Bigfusion",
     "ensemble_fusion":  "EnsembleFusion (new)",
+    "ft_molformer":     "FT-MoLFormer",
+    "ft_grover":        "FT-GROVER",
+    "ft_unimol":        "FT-UniMol",
+    "ft_fusion":        "FT-Fusion (new)",
 }
 
 
@@ -678,6 +760,47 @@ _MODEL_DESCRIPTIONS = {
         "loss":         "CombinedLoss = MVE + 0.1 × Spearman (per backbone)",
         "acquisition":  "UCB: μ_ens + 2·σ_total  (soft combination, not hard Borda)",
         "schedule":     "5 × EnsembleFusion rounds",
+    },
+    "ft_molformer": {
+        "full_name":    "FT-MoLFormer (Single Backbone Fine-tuning)",
+        "backbone":     "MoLFormer-XL (768-d, fine-tuned)",
+        "surrogate":    "SingleBackboneFinetuneScheduleSurrogate — 2 frozen rounds (dual MVE heads) "
+                        "then 3 fine-tuning rounds (BackboneFinetuner + re-extraction + MVE warm-start).",
+        "loss":         "Phase 1: CombinedLoss on frozen embeddings  |  Phase 2: MSE on labeled data "
+                        "(finetune) + CombinedLoss on re-extracted embeddings (MVE head)",
+        "acquisition":  "UCB: μ + 2σ",
+        "schedule":     "2 × frozen rounds, then 3 × fine-tune rounds",
+    },
+    "ft_grover": {
+        "full_name":    "FT-GROVER (Single Backbone Fine-tuning)",
+        "backbone":     "GROVER (256-d, fine-tuned)",
+        "surrogate":    "SingleBackboneFinetuneScheduleSurrogate — 2 frozen rounds (dual MVE heads) "
+                        "then 3 fine-tuning rounds (BackboneFinetuner + re-extraction + MVE warm-start).",
+        "loss":         "Phase 1: CombinedLoss on frozen embeddings  |  Phase 2: MSE on labeled data "
+                        "(finetune) + CombinedLoss on re-extracted embeddings (MVE head)",
+        "acquisition":  "UCB: μ + 2σ",
+        "schedule":     "2 × frozen rounds, then 3 × fine-tune rounds",
+    },
+    "ft_unimol": {
+        "full_name":    "FT-UniMol (Single Backbone Fine-tuning)",
+        "backbone":     "UniMol (512-d, fine-tuned)",
+        "surrogate":    "SingleBackboneFinetuneScheduleSurrogate — 2 frozen rounds (dual MVE heads) "
+                        "then 3 fine-tuning rounds (BackboneFinetuner + re-extraction + MVE warm-start).",
+        "loss":         "Phase 1: CombinedLoss on frozen embeddings  |  Phase 2: MSE on labeled data "
+                        "(finetune) + CombinedLoss on re-extracted embeddings (MVE head)",
+        "acquisition":  "UCB: μ + 2σ",
+        "schedule":     "2 × frozen rounds, then 3 × fine-tune rounds",
+    },
+    "ft_fusion": {
+        "full_name":    "FT-Fusion (All-Backbone Fine-tuning)",
+        "backbone":     "GROVER (256-d) + MoLFormer (768-d) + UniMol (512-d), all fine-tuned",
+        "surrogate":    "FTFusionSurrogate — 2 frozen rounds (Lightweight MLP on concatenated embeddings) "
+                        "then 3 fine-tuning rounds (finetune all 3 BackboneFinetuners + re-extraction + "
+                        "Lightweight MLP warm-start).",
+        "loss":         "Phase 1: CombinedLoss on frozen fused embeddings  |  Phase 2: MSE on labeled data "
+                        "(finetune all 3 backbones) + CombinedLoss on re-extracted fused embeddings (MLP head)",
+        "acquisition":  "Greedy: μ (no uncertainty)",
+        "schedule":     "2 × frozen rounds, then 3 × all-backbone fine-tune rounds",
     },
 }
 

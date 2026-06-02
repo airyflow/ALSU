@@ -913,3 +913,279 @@ class LightweightMoLFormerScheduleSurrogate:
         # X is a slice of the (possibly refreshed) fused matrix passed by Experiment.
         # After embeddings_refreshed is handled, X contains updated MoLFormer columns.
         return self._lightweight.predict(X)
+
+
+# ── SingleBackboneFinetuneScheduleSurrogate ──────────────────────────────────────
+
+class SingleBackboneFinetuneScheduleSurrogate:
+    """
+    Single-backbone surrogate with scheduled fine-tuning.
+
+    Phase 1 — first n_ft_delay fit() calls:
+        Freeze backbone, train dual MVE head on frozen embeddings.
+
+    Phase 2 — remaining fit() calls:
+        1. Finetune backbone on accumulated labeled data (BackboneFinetuner).
+        2. Re-extract embeddings for the full pool.
+        3. Signal Experiment to rebuild fused matrix.
+        4. Train dual MVE head on new embeddings (warm-start from phase 1).
+
+    This approach finetunes a single backbone for task-specific representations.
+
+    Parameters
+    ----------
+    backbone        : "grover" | "unimol" | "molformer"
+    in_dim          : embedding dimension of the backbone
+    pool_smiles     : ordered list of all pool SMILES
+    emb_dict        : mutable reference to Experiment.emb_dict (key: backbone name)
+    dataset_name    : e.g. "Enamine50k"
+    n_ft_delay      : rounds before switching to finetune (default 2)
+    ft_epochs       : backbone finetune epochs per round (default 10)
+    ft_lr_bb        : backbone learning rate (default 1e-5)
+    ft_lr_head      : regression head lr for finetuner (default 1e-4)
+    spearman_weight : λ for Spearman term in MVE head loss
+    lr              : learning rate for MVE head
+    dropout         : dropout probability
+    """
+
+    needs_smiles = True
+
+    def __init__(
+        self,
+        backbone: str,
+        in_dim: int,
+        pool_smiles: list,
+        emb_dict: dict,
+        dataset_name: str = "Enamine50k",
+        n_ft_delay: int = 2,
+        ft_epochs: int = 10,
+        ft_lr_bb: float = 1e-5,
+        ft_lr_head: float = 1e-4,
+        spearman_weight: float = 0.1,
+        lr: float = 3e-4,
+        dropout: float = 0.25,
+    ):
+        self._backbone = backbone
+        self._in_dim = in_dim
+        self._pool_smiles = pool_smiles
+        self._emb_dict = emb_dict
+        self._dataset_name = dataset_name
+        self._n_ft_delay = n_ft_delay
+        self._ft_epochs = ft_epochs
+        self._ft_lr_bb = ft_lr_bb
+        self._ft_lr_head = ft_lr_head
+        self._round_count = 0
+
+        self._mve = _DualMVEModel(in_dim, dropout)
+        self._mve = self._mve.to(DEVICE)
+        self._loss_fn = CombinedLoss(spearman_weight=spearman_weight)
+        self._lr = lr
+        self._dropout = dropout
+        self._ym = self._ys = None
+
+        self._finetuner = None
+        self._smi2idx = {s: i for i, s in enumerate(pool_smiles)}
+        self.embeddings_refreshed = False
+
+    def fit(
+        self,
+        X: np.ndarray,
+        y: np.ndarray,
+        epochs: int = 50,
+        batch: int = 256,
+        labeled_smiles: list | None = None,
+    ):
+        self._round_count += 1
+        self._ym = float(y.mean())
+        self._ys = float(y.std()) + 1e-8
+        y_norm = (y - self._ym) / self._ys
+
+        if self._round_count <= self._n_ft_delay:
+            # ── Phase 1: train MVE head on frozen embeddings ────────────────────
+            _train_model(self._mve, X, y_norm, self._loss_fn, epochs, batch, self._lr)
+
+        else:
+            # ── Phase 2: finetune backbone ─────────────────────────────────────
+            assert labeled_smiles is not None, (
+                f"SingleBackboneFinetuneScheduleSurrogate({self._backbone}) "
+                "needs labeled_smiles in phase 2"
+            )
+
+            # Load finetuner once
+            if self._finetuner is None:
+                from backbone_finetuner import BackboneFinetuner
+                self._finetuner = BackboneFinetuner(
+                    backbone=self._backbone,
+                    dataset_name=self._dataset_name,
+                    pool_smiles=self._pool_smiles,
+                )
+
+            # Finetune backbone + regression head
+            self._finetuner.finetune(
+                labeled_smiles=labeled_smiles,
+                labeled_scores=y,
+                n_epochs=self._ft_epochs,
+                batch_size=32,
+                lr_backbone=self._ft_lr_bb,
+                lr_head=self._ft_lr_head,
+            )
+
+            # Re-extract embeddings
+            new_emb = self._finetuner.extract_pool_embeddings(batch_size=256)
+            self._emb_dict[self._backbone] = new_emb
+
+            print(
+                f"  [{self._backbone}_finetune] backbone finetuned & "
+                f"re-extracted. shape={new_emb.shape}"
+            )
+
+            # Rebuild X_tr and retrain MVE head (warm-start)
+            pool_idx = np.array([self._smi2idx[s] for s in labeled_smiles])
+            new_X_tr = new_emb[pool_idx]
+            _train_model(self._mve, new_X_tr, y_norm, self._loss_fn, epochs, batch, self._lr)
+
+            # Signal Experiment to rebuild fused matrix
+            self.embeddings_refreshed = True
+
+    def predict(self, X: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        mu_n, sig_n = _predict_model(self._mve, X)
+        return mu_n * self._ys + self._ym, sig_n
+
+
+# ── FTFusionSurrogate ─────────────────────────────────────────────────────────
+
+class FTFusionSurrogate:
+    """
+    Multi-phase all-backbone fine-tuning fusion.
+
+    Phase 1 — first n_ft_delay fit() calls:
+        Freeze all backbones, train Lightweight MVE head on concatenated frozen embeddings.
+
+    Phase 2 — remaining fit() calls:
+        1. Finetune all three backbones sequentially on accumulated labeled data.
+        2. Re-extract embeddings for the full pool.
+        3. Signal Experiment to rebuild fused matrix.
+        4. Retrain Lightweight MVE head on new concatenated embeddings (warm-start).
+
+    This approach finetunes all backbones together for a unified task-specific
+    representation, unlike BigFusion which keeps them independent.
+
+    Parameters
+    ----------
+    dims            : {"grover": D_g, "molformer": D_m, "unimol": D_u}
+    pool_smiles     : ordered list of all pool SMILES
+    emb_dict        : mutable reference to Experiment.emb_dict
+    dataset_name    : e.g. "Enamine50k"
+    n_ft_delay      : rounds before switching to finetune (default 2)
+    ft_epochs       : backbone finetune epochs per round (default 8)
+    ft_lr_bb        : backbone learning rate (default 1e-5)
+    ft_lr_head      : regression head lr for finetuner (default 1e-4)
+    spearman_weight : λ for Spearman term in MVE head loss
+    lr              : learning rate for MVE head
+    dropout         : dropout probability
+    """
+
+    needs_smiles = True
+
+    def __init__(
+        self,
+        dims: dict,
+        pool_smiles: list,
+        emb_dict: dict,
+        dataset_name: str = "Enamine50k",
+        n_ft_delay: int = 2,
+        ft_epochs: int = 8,
+        ft_lr_bb: float = 1e-5,
+        ft_lr_head: float = 1e-4,
+        spearman_weight: float = 0.1,
+        lr: float = 3e-4,
+        dropout: float = 0.25,
+    ):
+        self._dims = dims
+        self._pool_smiles = pool_smiles
+        self._emb_dict = emb_dict
+        self._dataset_name = dataset_name
+        self._n_ft_delay = n_ft_delay
+        self._ft_epochs = ft_epochs
+        self._ft_lr_bb = ft_lr_bb
+        self._ft_lr_head = ft_lr_head
+        self._round_count = 0
+
+        total_dim = sum(dims[k] for k in ["grover", "molformer", "unimol"])
+        self._lightweight = _DualMVEModel(total_dim, dropout)
+        self._lightweight = self._lightweight.to(DEVICE)
+        self._loss_fn = CombinedLoss(spearman_weight=spearman_weight)
+        self._lr = lr
+        self._ym = self._ys = None
+
+        self._finetuners = {}  # {"grover": ft, "molformer": ft, "unimol": ft}
+        self._smi2idx = {s: i for i, s in enumerate(pool_smiles)}
+        self.embeddings_refreshed = False
+
+    def fit(
+        self,
+        X: np.ndarray,
+        y: np.ndarray,
+        epochs: int = 50,
+        batch: int = 256,
+        labeled_smiles: list | None = None,
+    ):
+        self._round_count += 1
+        self._ym = float(y.mean())
+        self._ys = float(y.std()) + 1e-8
+        y_norm = (y - self._ym) / self._ys
+
+        if self._round_count <= self._n_ft_delay:
+            # ── Phase 1: train MVE head on frozen embeddings ────────────────────
+            _train_model(self._lightweight, X, y_norm, self._loss_fn, epochs, batch, self._lr)
+
+        else:
+            # ── Phase 2: finetune all three backbones ──────────────────────────
+            assert labeled_smiles is not None, (
+                "FTFusionSurrogate needs labeled_smiles in phase 2"
+            )
+
+            from backbone_finetuner import BackboneFinetuner
+
+            # Lazy-init finetuners
+            for backbone in ["grover", "molformer", "unimol"]:
+                if backbone not in self._finetuners:
+                    self._finetuners[backbone] = BackboneFinetuner(
+                        backbone=backbone,
+                        dataset_name=self._dataset_name,
+                        pool_smiles=self._pool_smiles,
+                    )
+
+            # Finetune all three backbones on the same labeled set
+            print(f"  [FTFusion] finetuning all 3 backbones…")
+            for backbone in ["grover", "molformer", "unimol"]:
+                self._finetuners[backbone].finetune(
+                    labeled_smiles=labeled_smiles,
+                    labeled_scores=y,
+                    n_epochs=self._ft_epochs,
+                    batch_size=32,
+                    lr_backbone=self._ft_lr_bb,
+                    lr_head=self._ft_lr_head,
+                )
+
+                # Re-extract embeddings
+                new_emb = self._finetuners[backbone].extract_pool_embeddings(batch_size=256)
+                self._emb_dict[backbone] = new_emb
+
+            print(f"  [FTFusion] all backbones re-extracted")
+
+            # Rebuild concatenated matrix and retrain MVE head
+            pool_idx = np.array([self._smi2idx[s] for s in labeled_smiles])
+            new_X_tr = np.concatenate([
+                self._emb_dict["grover"][pool_idx],
+                self._emb_dict["molformer"][pool_idx],
+                self._emb_dict["unimol"][pool_idx],
+            ], axis=1)
+            _train_model(self._lightweight, new_X_tr, y_norm, self._loss_fn, epochs, batch, self._lr)
+
+            # Signal Experiment to rebuild fused matrix
+            self.embeddings_refreshed = True
+
+    def predict(self, X: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        mu_n, sig_n = _predict_model(self._lightweight, X)
+        return mu_n * self._ys + self._ym, sig_n
