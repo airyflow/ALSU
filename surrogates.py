@@ -1013,39 +1013,55 @@ class SingleBackboneFinetuneScheduleSurrogate:
 
             # Load finetuner once
             if self._finetuner is None:
-                from backbone_finetuner import BackboneFinetuner
-                self._finetuner = BackboneFinetuner(
-                    backbone=self._backbone,
-                    dataset_name=self._dataset_name,
-                    pool_smiles=self._pool_smiles,
-                )
+                try:
+                    from backbone_finetuner import BackboneFinetuner
+                    self._finetuner = BackboneFinetuner(
+                        backbone=self._backbone,
+                        dataset_name=self._dataset_name,
+                        pool_smiles=self._pool_smiles,
+                    )
+                except Exception as e:
+                    print(f"  [{self._backbone}] WARNING: Failed to load finetuner: {e}")
+                    print(f"  [{self._backbone}] Keeping frozen embeddings for remaining rounds")
+                    self._finetuner = False  # Mark as failed, skip future attempts
 
-            # Finetune backbone + regression head
-            self._finetuner.finetune(
-                labeled_smiles=labeled_smiles,
-                labeled_scores=y,
-                n_epochs=self._ft_epochs,
-                batch_size=32,
-                lr_backbone=self._ft_lr_bb,
-                lr_head=self._ft_lr_head,
-            )
+            # If finetuner is available, use it; otherwise keep frozen embeddings
+            if self._finetuner is not False:
+                try:
+                    # Finetune backbone + regression head
+                    self._finetuner.finetune(
+                        labeled_smiles=labeled_smiles,
+                        labeled_scores=y,
+                        n_epochs=self._ft_epochs,
+                        batch_size=32,
+                        lr_backbone=self._ft_lr_bb,
+                        lr_head=self._ft_lr_head,
+                    )
 
-            # Re-extract embeddings
-            new_emb = self._finetuner.extract_pool_embeddings(batch_size=256)
-            self._emb_dict[self._backbone] = new_emb
+                    # Re-extract embeddings
+                    new_emb = self._finetuner.extract_pool_embeddings(batch_size=256)
+                    self._emb_dict[self._backbone] = new_emb
 
-            print(
-                f"  [{self._backbone}_finetune] backbone finetuned & "
-                f"re-extracted. shape={new_emb.shape}"
-            )
+                    print(
+                        f"  [{self._backbone}_finetune] backbone finetuned & "
+                        f"re-extracted. shape={new_emb.shape}"
+                    )
 
-            # Rebuild X_tr and retrain MVE head (warm-start)
-            pool_idx = np.array([self._smi2idx[s] for s in labeled_smiles])
-            new_X_tr = new_emb[pool_idx]
-            _train_model(self._mve, new_X_tr, y_norm, self._loss_fn, epochs, batch, self._lr)
+                    # Rebuild X_tr and retrain MVE head (warm-start)
+                    pool_idx = np.array([self._smi2idx[s] for s in labeled_smiles])
+                    new_X_tr = new_emb[pool_idx]
+                    _train_model(self._mve, new_X_tr, y_norm, self._loss_fn, epochs, batch, self._lr)
 
-            # Signal Experiment to rebuild fused matrix
-            self.embeddings_refreshed = True
+                    # Signal Experiment to rebuild fused matrix
+                    self.embeddings_refreshed = True
+
+                except Exception as e:
+                    print(f"  [{self._backbone}] WARNING: Fine-tuning failed: {e}")
+                    print(f"  [{self._backbone}] Keeping frozen embeddings")
+                    self._finetuner = False
+            else:
+                # Finetuner unavailable, just retrain MVE head on frozen embeddings
+                _train_model(self._mve, X, y_norm, self._loss_fn, epochs, batch, self._lr)
 
     def predict(self, X: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         mu_n, sig_n = _predict_model(self._mve, X)
@@ -1147,32 +1163,41 @@ class FTFusionSurrogate:
 
             from backbone_finetuner import BackboneFinetuner
 
-            # Lazy-init finetuners
-            for backbone in ["grover", "molformer", "unimol"]:
-                if backbone not in self._finetuners:
-                    self._finetuners[backbone] = BackboneFinetuner(
-                        backbone=backbone,
-                        dataset_name=self._dataset_name,
-                        pool_smiles=self._pool_smiles,
-                    )
-
             # Finetune all three backbones on the same labeled set
             print(f"  [FTFusion] finetuning all 3 backbones…")
             for backbone in ["grover", "molformer", "unimol"]:
-                self._finetuners[backbone].finetune(
-                    labeled_smiles=labeled_smiles,
-                    labeled_scores=y,
-                    n_epochs=self._ft_epochs,
-                    batch_size=32,
-                    lr_backbone=self._ft_lr_bb,
-                    lr_head=self._ft_lr_head,
-                )
+                # Lazy-init finetuner (only when about to use)
+                if backbone not in self._finetuners:
+                    try:
+                        self._finetuners[backbone] = BackboneFinetuner(
+                            backbone=backbone,
+                            dataset_name=self._dataset_name,
+                            pool_smiles=self._pool_smiles,
+                        )
+                    except Exception as e:
+                        print(f"  [FTFusion] WARNING: Failed to load {backbone} finetuner: {e}")
+                        print(f"  [FTFusion] Skipping {backbone} fine-tuning; using frozen embeddings")
+                        continue
 
-                # Re-extract embeddings
-                new_emb = self._finetuners[backbone].extract_pool_embeddings(batch_size=256)
-                self._emb_dict[backbone] = new_emb
+                try:
+                    self._finetuners[backbone].finetune(
+                        labeled_smiles=labeled_smiles,
+                        labeled_scores=y,
+                        n_epochs=self._ft_epochs,
+                        batch_size=32,
+                        lr_backbone=self._ft_lr_bb,
+                        lr_head=self._ft_lr_head,
+                    )
 
-            print(f"  [FTFusion] all backbones re-extracted")
+                    # Re-extract embeddings
+                    new_emb = self._finetuners[backbone].extract_pool_embeddings(batch_size=256)
+                    self._emb_dict[backbone] = new_emb
+                except Exception as e:
+                    print(f"  [FTFusion] WARNING: Fine-tuning {backbone} failed: {e}")
+                    print(f"  [FTFusion] Keeping {backbone} frozen embeddings")
+                    continue
+
+            print(f"  [FTFusion] fine-tuning phase complete")
 
             # Rebuild concatenated matrix and retrain MVE head
             pool_idx = np.array([self._smi2idx[s] for s in labeled_smiles])
