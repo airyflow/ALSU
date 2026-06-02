@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
 Embedding extraction using MUBen backbones.
-SMILES source of truth: molpal/libraries/Enamine50k.csv.gz
-Output: results/embed/Enamine50k/{backbone}_embeddings.npz
+SMILES source of truth: molpal/libraries/EnamineHTS.csv.gz
+Output: results/embed/EnamineHTS/{backbone}_embeddings.npz
         contains both 'embeddings' (N,D) and 'smiles' (N,) so
         row alignment is always self-documenting.
 """
@@ -13,6 +13,7 @@ import sys
 import time
 import types
 import argparse
+import gc  # Crucial for explicit memory clearing
 import numpy as np
 import pandas as pd
 import torch
@@ -31,7 +32,7 @@ OUTPUT_DIR = ROOT / "results" / "embed"
 # add temporarily under ROOT definition to verify paths before running
 print(f"ROOT:       {ROOT}")
 print(f"MOLPAL_LIB: {MOLPAL_LIB}")
-print(f"library:    {MOLPAL_LIB / 'Enamine50k.csv.gz'}  exists={( MOLPAL_LIB / 'Enamine50k.csv.gz').exists()}")
+print(f"library:    {MOLPAL_LIB / 'EnamineHTS.csv.gz'}  exists={( MOLPAL_LIB / 'EnamineHTS.csv.gz').exists()}")
 print(f"MODEL_ZOO:  {MODEL_ZOO}")
 print(f"OUTPUT_DIR: {OUTPUT_DIR}")
 
@@ -42,7 +43,7 @@ if torch.cuda.is_available():
 else:
     DEVICE = torch.device("cpu")
 
-DATASET = "Enamine50k"      # swap to Enamine10k / EnamineHTS
+DATASET = "EnamineHTS"      # swap to Enamine10k / EnamineHTS
 OUT_DIR  = OUTPUT_DIR / DATASET
 OUT_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -117,7 +118,7 @@ class MubenRuntimeConfig:
         self.num_preprocess_workers      = 4
 
         # Cache conformers to disk — biggest single speedup
-        self.ignore_preprocessed_dataset = False
+        self.ignore_preprocessed_dataset = True
         self.disable_dataset_saving      = False
         self.disable_checkpoint_loading  = False
 
@@ -245,7 +246,9 @@ def extract_grover(smiles: list[str]):
 
 
 def extract_unimol(smiles: list[str]):
-    print("\n>>> Uni-Mol 3D Conformational Representations...")
+    print("\n>>> Uni-Mol 3D Conformational Representations (Processing Chunks sequentially)...")
+
+    amp_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
 
     from muben.dataset import DatasetUniMol
     from muben.dataset.dataset_unimol import CollatorUniMol
@@ -253,34 +256,14 @@ def extract_unimol(smiles: list[str]):
     from muben.model.unimol.unimol import UniMol
 
     unimol_ckpt = MODEL_ZOO / "unimol" / "mol_pre_all_h_220816.pt"
-    config = MubenRuntimeConfig(
-        model_name="unimol",
-        feature_type="unimol",
-        checkpoint_path=unimol_ckpt,
-    )
-
-    dataset = DatasetUniMol()
-    dataset.prepare(config=config, partition="train")
-
+    
+    # Pre-load Shared Static Configuration & Dictionary
     unimol_dict = DictionaryUniMol.load()
     unimol_dict.add_symbol("[MASK]", is_special=True)
+    pad_idx = unimol_dict.pad()
     print(f"[dict] vocab size: {len(unimol_dict)}")
 
-    collator = CollatorUniMol(config, unimol_dict)
-    pad_idx  = unimol_dict.pad()
-    collator._atom_pad_idx = pad_idx
-    collator.pad_idx       = pad_idx
-    collator.atom_pad_idx  = pad_idx
-
-    loader = DataLoader(
-        dataset, batch_size=256, shuffle=False,
-        collate_fn=collator,
-        num_workers=4, pin_memory=True,
-        persistent_workers=True, prefetch_factor=2,
-    )
-
-    model = UniMol(config=config, dictionary=unimol_dict).to(DEVICE)
-
+    # Define the embedded monkey-patch function
     def _get_embeddings(self, batch):
         src_tokens, src_distance, src_edge_type = (
             batch.atoms, batch.distances, batch.edge_types,
@@ -289,31 +272,100 @@ def extract_unimol(smiles: list[str]):
         if not padding_mask.any():
             padding_mask = None
 
-        x          = self.embed_tokens(src_tokens)
-        n_node     = src_distance.size(-1)
-        gbf_feat   = self.gbf(src_distance, src_edge_type)
-        gbf_result = self.gbf_proj(gbf_feat)
-        attn_bias  = gbf_result.permute(0, 3, 1, 2).contiguous().view(-1, n_node, n_node)
+        x = self.embed_tokens(src_tokens)
+        n_node = src_distance.size(-1)
+        gbf_feat = self.gbf(src_distance, src_edge_type)
+        gbf_proj_out = self.gbf_proj(gbf_feat)
+
+        attn_bias = gbf_proj_out.permute(0, 3, 1, 2).contiguous().view(-1, n_node, n_node)
+        attn_bias = attn_bias.to(x.device, dtype=amp_dtype) 
 
         encoder_rep, _, _, _, _ = self.encoder(
             x, padding_mask=padding_mask, attn_mask=attn_bias
         )
-        return self.hidden_layer(encoder_rep[:, 0, :])   # CLS token → (B, 512)
+        return self.hidden_layer(encoder_rep[:, 0, :])
 
-    model.get_embeddings = types.MethodType(_get_embeddings, model)
-    model.eval()
+    # --- CHUNKING WORKFLOW START ---
+    import tqdm
+    num_chunks = 20
+    total_mols = len(smiles)
+    chunk_size = int(np.ceil(total_mols / num_chunks))
+    chunk_files = []
 
-    embeddings = []
-    amp_dtype  = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+    for chunk_idx in range(num_chunks):
+        start_idx = chunk_idx * chunk_size
+        end_idx = min(start_idx + chunk_size, total_mols)
+        if start_idx >= total_mols:
+            break
 
-    with torch.no_grad():
-        for batch in loader:
-            batch.to(DEVICE)
-            with torch.autocast(device_type="cuda", dtype=amp_dtype):
-                feat = model.get_embeddings(batch)
-            embeddings.append(feat.float().cpu().numpy())
+        print(f"\n--- [Chunk {chunk_idx + 1}/{num_chunks}] Indices {start_idx:,} to {end_idx:,} ---")
+        chunk_smiles = smiles[start_idx:end_idx]
 
-    matrix = np.vstack(embeddings)
+        # 1. Update the global Dataset structure dynamically for just this block
+        patch_muben_dataset(chunk_smiles)
+        
+        # 2. Build configuration, dataset, model fresh every chunk to release RAM blocks completely
+        config = MubenRuntimeConfig(
+            model_name="unimol",
+            feature_type="unimol",
+            checkpoint_path=unimol_ckpt,
+        )
+        config.num_preprocess_workers = 32  # Use high processing speed per chunk
+
+        dataset = DatasetUniMol()
+        dataset.prepare(config=config, partition="train")
+
+        collator = CollatorUniMol(config, unimol_dict)
+        collator._atom_pad_idx = pad_idx
+        collator.pad_idx       = pad_idx
+        collator.atom_pad_idx  = pad_idx
+
+        loader = DataLoader(
+            dataset, 
+            batch_size=256, 
+            shuffle=False,
+            collate_fn=collator,
+            num_workers=16, # Multi-processing for 3D Generation per chunk            
+            pin_memory=True,           
+            persistent_workers=False, # Turned off so worker memory completely drops post-chunk  
+            prefetch_factor=2,         
+        )
+
+        model = UniMol(config=config, dictionary=unimol_dict).to(DEVICE)
+        model.get_embeddings = types.MethodType(_get_embeddings, model)
+        model.eval()
+
+        chunk_embeddings = []
+        with torch.no_grad():
+            for batch in tqdm.tqdm(loader, desc=f"Uni-Mol Processing"):
+                batch.to(DEVICE)
+                with torch.autocast(device_type="cuda", dtype=amp_dtype):
+                    feat = model.get_embeddings(batch)
+                chunk_embeddings.append(feat.float().cpu().numpy())
+
+        # Save this chunk array instantly down to local storage to rescue active system RAM
+        chunk_matrix = np.vstack(chunk_embeddings)
+        temp_chunk_path = OUT_DIR / f"unimol_chunk_{chunk_idx}.npy"
+        np.save(temp_chunk_path, chunk_matrix)
+        chunk_files.append(temp_chunk_path)
+
+        print(f"[Chunk {chunk_idx + 1} Saved] -> {temp_chunk_path.name}")
+
+        # 3. Aggressive isolation: Delete everything except path lists before moving forward
+        del dataset, collator, loader, model, config, chunk_embeddings, chunk_matrix, chunk_smiles
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    print("\n>>> Re-combining all saved Uni-Mol chunk logs from disk storage...")
+    final_matrices = [np.load(f) for f in chunk_files]
+    matrix = np.vstack(final_matrices)
+
+    # Erase the intermediate chunk scratchpads
+    for f in chunk_files:
+        f.unlink()
+    # --- CHUNKING WORKFLOW END ---
+
     return save_embeddings("unimol", matrix, smiles)
 
 
@@ -367,7 +419,7 @@ if __name__ == "__main__":
     run_ts     = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     extractors = [
-        ("grover",    extract_grover),
+        # ("grover",    extract_grover),
         ("unimol",    extract_unimol),
         ("molformer", extract_molformer),
     ]
@@ -392,6 +444,11 @@ if __name__ == "__main__":
         }
         records.append(record)
         print(f"  [{backbone}] done in {elapsed:.1f}s")
+        
+        # Post backbone garbage cleaning
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     total_elapsed = time.perf_counter() - total_t0
     print(f"\n[done] Total extraction time: {total_elapsed:.1f}s")
