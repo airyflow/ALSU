@@ -210,7 +210,7 @@ def extract_grover(smiles: list[str]):
 
     collator = CollatorGrover(config)
     loader   = DataLoader(
-        dataset, batch_size=256, shuffle=False,
+        dataset, batch_size=128, shuffle=False,
         collate_fn=collator,
         num_workers=4, pin_memory=True,
         persistent_workers=True, prefetch_factor=2,
