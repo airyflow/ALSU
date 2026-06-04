@@ -51,6 +51,7 @@ from surrogates import (
     LearnedFusionSurrogate,
     NonlinearFusionSurrogate,
     OOFFusionSurrogate,
+    AttentionFusionSurrogate,
     LightweightMoLFormerScheduleSurrogate,
     SingleBackboneFinetuneScheduleSurrogate,
     FTFusionSurrogate,
@@ -439,6 +440,11 @@ def build_learned_fusion(emb_dict, **kw):
     return [(N_ROUNDS, LearnedFusionSurrogate(dims=dims), "bigfusion")]
 
 
+def build_attention_fusion(emb_dict, **kw):
+    dims = {k: emb_dict[k].shape[1] for k in ["grover", "molformer", "unimol"]}
+    return [(N_ROUNDS, AttentionFusionSurrogate(dims=dims), "bigfusion")]
+
+
 def build_nonlinear_fusion(emb_dict, **kw):
     dims = {k: emb_dict[k].shape[1] for k in ["grover", "molformer", "unimol"]}
     return [(N_ROUNDS, NonlinearFusionSurrogate(dims=dims), "bigfusion")]
@@ -542,6 +548,7 @@ EXPERIMENTS = {
     "ensemble_fusion":  (build_ensemble_fusion,   acq_greedy),
     "fixed_borda":       (build_fixed_borda,       acq_borda),
     "learned_fusion":    (build_learned_fusion,    acq_greedy),
+    "attention_fusion":  (build_attention_fusion,  acq_greedy),
     "nonlinear_fusion":  (build_nonlinear_fusion,  acq_greedy),
     "oof_fusion":        (build_oof_fusion,         acq_greedy),
     "3lt_2mf":           (build_3lt_2mf,            acq_greedy),
@@ -599,6 +606,10 @@ COLORS = {
     "mixed_4lt_1g":     "#E74C3C",
     "bigfusion":        "#6DBF87",
     "ensemble_fusion":  "#F1C40F",
+    "learned_fusion":   "#C39BD3",
+    "attention_fusion": "#BB8FCE",
+    "nonlinear_fusion": "#A569BD",
+    "oof_fusion":       "#884EA0",
     "ft_molformer":     "#FF6B9D",
     "ft_grover":        "#4ECDC4",
     "ft_unimol":        "#95E1D3",
@@ -610,11 +621,15 @@ LABELS = {
     "mixed_3lt_2g":     "Mixed(3LT+2G)",
     "mixed_4lt_1g":     "Mixed(4LT+1G)",
     "bigfusion":        "Bigfusion",
-    "ensemble_fusion":  "EnsembleFusion (new)",
+    "ensemble_fusion":  "EnsembleFusion",
+    "learned_fusion":   "LearnedFusion",
+    "attention_fusion": "AttentionFusion (new)",
+    "nonlinear_fusion": "NonlinearFusion",
+    "oof_fusion":       "OOFFusion",
     "ft_molformer":     "FT-MoLFormer",
     "ft_grover":        "FT-GROVER",
     "ft_unimol":        "FT-UniMol",
-    "ft_fusion":        "FT-Fusion (new)",
+    "ft_fusion":        "FT-Fusion",
 }
 
 
@@ -760,6 +775,16 @@ _MODEL_DESCRIPTIONS = {
         "loss":         "CombinedLoss = MVE + 0.1 × Spearman (per backbone)",
         "acquisition":  "UCB: μ_ens + 2·σ_total  (soft combination, not hard Borda)",
         "schedule":     "5 × EnsembleFusion rounds",
+    },
+    "attention_fusion": {
+        "full_name":    "AttentionFusion (Learned Attention Weights)",
+        "backbone":     "3 independent backbones: GROVER, MoLFormer, UniMol",
+        "surrogate":    "AttentionFusionSurrogate — 3 SingleBackboneMVESurrogates with learned "
+                        "attention module that produces per-molecule soft weights over backbones. "
+                        "Attention weights adapt based on backbone predictions (μ, σ) and learned patterns.",
+        "loss":         "CombinedLoss = MVE + 0.1 × Spearman (per backbone) | MSE (attention module)",
+        "acquisition":  "Greedy: μ (attention-weighted combination)",
+        "schedule":     "5 × AttentionFusion rounds",
     },
     "ft_molformer": {
         "full_name":    "FT-MoLFormer (Single Backbone Fine-tuning)",

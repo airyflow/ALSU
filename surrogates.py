@@ -641,6 +641,196 @@ class NonlinearFusionSurrogate:
         return np.concatenate(preds), np.zeros(n, dtype=np.float32)
 
 
+# ── AttentionFusionSurrogate ───────────────────────────────────────────────────
+
+class _AttentionModule(nn.Module):
+    """
+    Learns soft per-backbone weights based on (μ, σ) predictions.
+
+    Input:  [μ_g, σ_g, μ_m, σ_m, μ_u, σ_u]  shape (B, 6)
+    Output: [w_g, w_m, w_u] via softmax      shape (B, 3)
+
+    Architecture: (6) → 32 → 16 → 3 (logits) → softmax
+    This allows the model to learn how much to trust each backbone based on
+    their individual confidence and relative agreement/disagreement.
+    """
+    def __init__(self, dropout: float = 0.15):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(6, 32), nn.GELU(), nn.Dropout(dropout),
+            nn.Linear(32, 16), nn.GELU(), nn.Dropout(dropout),
+            nn.Linear(16, 3),  # logits for 3 backbones
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        x: shape (B, 6)
+        returns: shape (B, 3) — softmax-normalized weights
+        """
+        logits = self.net(x)  # (B, 3)
+        return F.softmax(logits, dim=-1)  # (B, 3) with sum=1 per row
+
+
+class AttentionFusionSurrogate:
+    """
+    Three backbone surrogates combined via learned attention weights.
+
+    Unlike LearnedFusion (linear meta-learner) or NonlinearFusion (MLP on 6 features),
+    this uses an attention mechanism that learns soft per-molecule weights over the
+    three backbones. The weights adapt based on:
+    - Each backbone's confidence (σ)
+    - Patterns in disagreement/agreement across backbones
+    - Task-specific learned preferences
+
+    fit() workflow (80/20 holdout, same as NonlinearFusion):
+      1. Train 3 backbone surrogates on 80% of labeled data.
+      2. Collect (µ, σ) from all three backbones on 20% holdout.
+      3. Train attention network on 6-feature vectors → 3 per-backbone weights.
+      4. Final prediction: weighted sum w_g*µ_g + w_m*µ_m + w_u*µ_u
+
+    predict() returns (mu_attn, zeros) — use with acq_greedy.
+
+    Parameters
+    ----------
+    dims       : dict {"grover": int, "molformer": int, "unimol": int}
+    """
+
+    _KEYS = ["grover", "molformer", "unimol"]
+
+    def __init__(
+        self,
+        dims: dict,
+        spearman_weight: float = 0.1,
+        lr: float = 3e-4,
+        dropout: float = 0.25,
+        meta_epochs: int = 500,
+        meta_lr: float = 3e-3,
+    ):
+        self._dims = dims
+        self._surrogates = {
+            k: SingleBackboneMVESurrogate(
+                in_dim=dims[k],
+                spearman_weight=spearman_weight,
+                lr=lr,
+                dropout=dropout,
+            )
+            for k in self._KEYS
+        }
+        self._meta_epochs = meta_epochs
+        self._meta_lr = meta_lr
+        self._attention: _AttentionModule | None = None
+
+    def _split(self, X: np.ndarray) -> dict:
+        cuts = np.cumsum([self._dims[k] for k in self._KEYS])
+        splits = np.split(X, cuts[:-1], axis=1)
+        return {k: s for k, s in zip(self._KEYS, splits)}
+
+    def _backbone_features(self, parts: dict) -> np.ndarray:
+        """Stack [µ_g, σ_g, µ_m, σ_m, µ_u, σ_u] → (N, 6) float32."""
+        cols = []
+        for k in self._KEYS:
+            mu, sig = self._surrogates[k].predict(parts[k])
+            cols.extend([mu, sig])
+        return np.stack(cols, axis=1).astype(np.float32)
+
+    def fit(self, X: np.ndarray, y: np.ndarray, epochs: int = 50, batch: int = 256):
+        parts = X if isinstance(X, dict) else self._split(X)
+        n = len(y)
+
+        # 80/20 holdout — attention must see out-of-sample backbone predictions
+        rng = np.random.default_rng(n)
+        val_idx = rng.choice(n, size=max(1, n // 5), replace=False)
+        tr_mask = np.ones(n, dtype=bool)
+        tr_mask[val_idx] = False
+
+        parts_tr = {k: v[tr_mask] for k, v in parts.items()}
+        parts_vl = {k: v[~tr_mask] for k, v in parts.items()}
+        y_tr, y_vl = y[tr_mask], y[~tr_mask]
+
+        for k in self._KEYS:
+            self._surrogates[k].fit(parts_tr[k], y_tr, epochs=epochs, batch=batch)
+
+        # 6-feature matrix from holdout backbone predictions
+        X_vl = self._backbone_features(parts_vl)  # (n_val, 6)
+        Xt = torch.tensor(X_vl).to(DEVICE)
+        yt = torch.tensor(y_vl, dtype=torch.float32).to(DEVICE)
+
+        # Collect backbone µ values for weighted combination
+        mus_vl = np.stack(
+            [self._surrogates[k].predict(parts_vl[k])[0] for k in self._KEYS],
+            axis=1,
+        )  # (n_val, 3)
+        mus_t = torch.tensor(mus_vl, dtype=torch.float32).to(DEVICE)
+
+        # Fresh attention module each round
+        self._attention = _AttentionModule().to(DEVICE)
+        opt = torch.optim.Adam(
+            self._attention.parameters(), lr=self._meta_lr, weight_decay=1e-3
+        )
+
+        self._attention.train()
+        for _ in range(self._meta_epochs):
+            opt.zero_grad()
+
+            # Get per-backbone weights: (n_val, 3)
+            weights = self._attention(Xt)  # softmax over dim=-1
+
+            # Weighted sum of backbone predictions
+            weighted_mu = (weights * mus_t).sum(dim=1)  # (n_val,)
+
+            loss = F.mse_loss(weighted_mu, yt)
+            loss.backward()
+            opt.step()
+
+        self._attention.eval()
+        with torch.no_grad():
+            weights_final = self._attention(Xt)
+            pred_final = (weights_final * mus_t).sum(dim=1)
+            val_rho = _spearman_np(pred_final.cpu().numpy(), y_vl)
+
+        # Log attention weights (which backbones it learned to prefer)
+        avg_weights = weights_final.mean(dim=0).cpu().numpy()
+        weight_str = "  ".join(f"{k}:{w:.3f}" for k, w in zip(self._KEYS, avg_weights))
+        print(
+            f"  [AttentionFusion] val Spearman ρ = {val_rho:.3f}  "
+            f"avg weights — {weight_str}  (n_val={len(y_vl)})"
+        )
+
+    def predict(self, X: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        parts = X if isinstance(X, dict) else self._split(X)
+        n = len(next(iter(parts.values())))
+
+        if self._attention is None:
+            return np.zeros(n, dtype=np.float32), np.zeros(n, dtype=np.float32)
+
+        # Get (µ, σ) from all backbones
+        mus = np.stack(
+            [self._surrogates[k].predict(parts[k])[0] for k in self._KEYS],
+            axis=1,
+        )  # (N, 3)
+
+        # Get features [µ_g, σ_g, µ_m, σ_m, µ_u, σ_u]
+        cols = []
+        for k in self._KEYS:
+            mu, sig = self._surrogates[k].predict(parts[k])
+            cols.extend([mu, sig])
+        feats = np.stack(cols, axis=1).astype(np.float32)  # (N, 6)
+
+        self._attention.eval()
+        preds = []
+        with torch.no_grad():
+            for i in range(0, n, 4096):
+                feat_batch = torch.tensor(feats[i : i + 4096]).to(DEVICE)
+                mu_batch = torch.tensor(mus[i : i + 4096], dtype=torch.float32).to(DEVICE)
+
+                # Get per-backbone weights and apply
+                weights = self._attention(feat_batch)  # (B, 3)
+                weighted_pred = (weights * mu_batch).sum(dim=1)  # (B,)
+                preds.append(weighted_pred.float().cpu().numpy())
+
+        return np.concatenate(preds), np.zeros(n, dtype=np.float32)
+
+
 # ── OOFFusionSurrogate ─────────────────────────────────────────────────────────
 
 class OOFFusionSurrogate:
@@ -1165,6 +1355,7 @@ class FTFusionSurrogate:
 
             # Finetune all three backbones on the same labeled set
             print(f"  [FTFusion] finetuning all 3 backbones…")
+            failed_backbones = []
             for backbone in ["grover", "molformer", "unimol"]:
                 # Lazy-init finetuner (only when about to use)
                 if backbone not in self._finetuners:
@@ -1177,6 +1368,7 @@ class FTFusionSurrogate:
                     except Exception as e:
                         print(f"  [FTFusion] WARNING: Failed to load {backbone} finetuner: {e}")
                         print(f"  [FTFusion] Skipping {backbone} fine-tuning; using frozen embeddings")
+                        failed_backbones.append(backbone)
                         continue
 
                 try:
@@ -1195,21 +1387,28 @@ class FTFusionSurrogate:
                 except Exception as e:
                     print(f"  [FTFusion] WARNING: Fine-tuning {backbone} failed: {e}")
                     print(f"  [FTFusion] Keeping {backbone} frozen embeddings")
+                    failed_backbones.append(backbone)
                     continue
 
-            print(f"  [FTFusion] fine-tuning phase complete")
+            if failed_backbones:
+                print(f"  [FTFusion] WARNING: {len(failed_backbones)} backbone(s) failed ({', '.join(failed_backbones)}). "
+                      f"Keeping all embeddings frozen for this round.")
+                # Don't update embeddings if any backbone failed (dimension mismatch)
+                _train_model(self._lightweight, X, y_norm, self._loss_fn, epochs, batch, self._lr)
+            else:
+                print(f"  [FTFusion] all 3 backbones fine-tuned & re-extracted")
 
-            # Rebuild concatenated matrix and retrain MVE head
-            pool_idx = np.array([self._smi2idx[s] for s in labeled_smiles])
-            new_X_tr = np.concatenate([
-                self._emb_dict["grover"][pool_idx],
-                self._emb_dict["molformer"][pool_idx],
-                self._emb_dict["unimol"][pool_idx],
-            ], axis=1)
-            _train_model(self._lightweight, new_X_tr, y_norm, self._loss_fn, epochs, batch, self._lr)
+                # Rebuild concatenated matrix and retrain MVE head
+                pool_idx = np.array([self._smi2idx[s] for s in labeled_smiles])
+                new_X_tr = np.concatenate([
+                    self._emb_dict["grover"][pool_idx],
+                    self._emb_dict["molformer"][pool_idx],
+                    self._emb_dict["unimol"][pool_idx],
+                ], axis=1)
+                _train_model(self._lightweight, new_X_tr, y_norm, self._loss_fn, epochs, batch, self._lr)
 
-            # Signal Experiment to rebuild fused matrix
-            self.embeddings_refreshed = True
+                # Signal Experiment to rebuild fused matrix (only if ALL succeeded)
+                self.embeddings_refreshed = True
 
     def predict(self, X: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         mu_n, sig_n = _predict_model(self._lightweight, X)
